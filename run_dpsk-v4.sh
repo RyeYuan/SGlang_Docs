@@ -24,19 +24,43 @@ Usage:
 Positional arguments:
   PORT        Service port. Default: 30000.
   MODEL_PATH  Model checkpoint. Default: DeepSeek-V4-Flash-FP8-Channel.
-  RANK_ID     Kept for launcher compatibility; currently not consumed.
+  RANK_ID     Node rank for multi-node launch; compatibility placeholder on one node.
   HOST        Optional distributed-init host alias. Supported: node18, node20,
               node22, node26, sglang2. Default: first local IP address.
 
 Core selectors:
   HCU_NUM=8                 Number of HCUs / TP size (default: 8).
   PD_MODE=none|prefill|decode
-                              Select TP, prefill CP, or decode DP topology.
+                            Select TP, prefill CP, or decode DP topology.
   PD_OPEN=0|1               Add PD disaggregation transport arguments.
   MOE_MODE=deepep|megamoe   Target MoE runtime selection (default: deepep).
   MTP_MODE=none|mtp|dspark  Speculative mode (default: none).
   IS_INT8=0|1               Enable SlimQuant INT8 loading.
   IS_FP8=0|1                Enable FP8 HCU optimization flags (default: 1).
+  WEIGHT_LOAD_THREADS=N     Safetensors loader threads per local rank (default: 64).
+  WEIGHT_LOAD_MULTITHREAD=0|1
+                            Enable the multithreaded safetensors iterator (default: 1).
+  WEIGHT_LOADER_PREFETCH=0|1
+                            Prefetch disjoint checkpoint shards into each node's page cache.
+  WEIGHT_LOADER_PREFETCH_THREADS=N
+                            Prefetch threads per local rank (default: 4).
+  DSPARK_MOE_MODE=none|deepep
+                            DSpark MoE runtime selection (default: none).
+  DSPARK_VARIANT=static|compact-sps|compact-sps-sts
+                            DSpark verify variant (default: static).
+  NNODES=N                    Multi-node count when HCU_NUM > 8 (default: 2).
+  NODE_RANK=N                 Overrides positional RANK_ID.
+  DIST_INIT_PORT=N            Generic multi-node init port (default: 6145).
+  PD_PREFILL_DIST_PORT=N      PD P-side init port (default: 6144).
+  PD_DECODE_DIST_PORT=N       PD D-side init port (default: 6244).
+  DECODE_DIST_INIT_PORT=N     Single-node decode init port (default: PORT + 733).
+
+Distributed init-address precedence (exactly one --dist-init-addr is emitted):
+  PD P side     HOST:PD_PREFILL_DIST_PORT
+  PD D side     HOST:PD_DECODE_DIST_PORT
+  Other multi-node runs  HOST:DIST_INIT_PORT
+  Single-node decode     127.0.0.1:DECODE_DIST_INIT_PORT
+  Single-node TP/prefill without PD does not set an explicit init address.
 
 Parallel and test combinations:
   1. Pure TP
@@ -101,6 +125,10 @@ Examples:
   # Pure DSpark standalone target/draft validation
   MTP_MODE=dspark bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
+  # DeepEP DSpark standalone target/draft validation
+  MTP_MODE=dspark DSPARK_MOE_MODE=deepep \
+    bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
+
   # DSpark compact SPS + STS standalone validation
   MTP_MODE=dspark DSPARK_VARIANT=compact-sps-sts bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
@@ -121,6 +149,17 @@ Examples:
 
   # INT8 pure TP
   IS_INT8=1 IS_FP8=0 bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-Channel-INT8-w8a8
+
+  # Generic 2-node launch: use the same master HOST on both nodes.
+  HCU_NUM=16 NNODES=2 bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel 0 node26
+  HCU_NUM=16 NNODES=2 bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel 1 node26
+
+  # Two-node DSpark PD: P uses 6144, D uses 6244 by default.
+  # Repeat each command with final RANK_ID=1 on the worker node.
+  HCU_NUM=16 NNODES=2 PD_OPEN=1 PD_MODE=prefill MTP_MODE=dspark \
+    bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel 0 node26
+  HCU_NUM=16 NNODES=2 PD_OPEN=1 PD_MODE=decode MTP_MODE=dspark \
+    bash run_dpsk-v4.sh 10016 /module/DeepSeek-V4-Flash-0731-FP8-Channel 0 node26
 
   # Inspect the generated command without starting a service
   DRY_RUN=1 MTP_MODE=dspark DSPARK_VARIANT=compact-sps-sts \
@@ -152,7 +191,7 @@ resolve_ip() {
 
 resolve_network_interface() {
     case "$1" in
-        nmz26|nmz20|nmz22|nmz18|nmz15) echo ens14f0 ;;
+        nmz26|nmz20|nmz22|nmz18|nmz15) echo ens66f1np1 ;;
         sglang5) echo eth0 ;;
         sglang8) echo enp113s0f0np0 ;;
         sglang6) echo eth10 ;;
@@ -170,14 +209,37 @@ append_deepep_args() {
 
 append_pd_args() {
     local mode=$1
-    local dist_port=$2
     DEFAULT_ARGS+=(
         --disaggregation-ib-device "$IB_DEVICES"
         --disaggregation-mode "$mode"
         --disaggregation-transfer-backend mooncake
         --disaggregation-bootstrap-port "$pd_bootstrap_port"
-        --dist-init-addr "$ip:$dist_port"
     )
+}
+
+resolve_dist_init_addr() {
+    # Keep this as the sole source of --dist-init-addr. PD P/D need stable,
+    # distinct ports so both services can coexist on one host; a generic
+    # multi-node group uses its own port; single-node decode keeps the
+    # historical port-derived local address.
+    if [[ "$pd_open" == 1 ]]; then
+        case "$pd_mode" in
+            prefill) echo "$ip:$pd_prefill_dist_port" ;;
+            decode) echo "$ip:$pd_decode_dist_port" ;;
+            *) die "PD_OPEN=1 requires PD_MODE=prefill or PD_MODE=decode" ;;
+        esac
+    elif (( is_multi_node )); then
+        echo "$ip:$multi_node_dist_port"
+    elif [[ "$pd_mode" == decode ]]; then
+        echo "127.0.0.1:$local_decode_dist_port"
+    fi
+}
+
+append_distributed_init_args() {
+    if (( is_multi_node )); then
+        DEFAULT_ARGS+=(--nnodes "$nnodes" --node-rank "$node_rank")
+    fi
+    [[ -z "$dist_init_addr" ]] || DEFAULT_ARGS+=(--dist-init-addr "$dist_init_addr")
 }
 
 require_file() {
@@ -307,12 +369,10 @@ append_prefill_parallel_args() {
         [[ "$mtp_mode" != dspark ]] || DEFAULT_ARGS+=(--moe-runner-backend deep_gemm)
     fi
 
-    [[ "$pd_open" != 1 ]] || append_pd_args prefill "$pd_prefill_dist_port"
+    [[ "$pd_open" != 1 ]] || append_pd_args prefill
 }
 
 append_decode_parallel_args() {
-    local generic_dist_port=$((port + 733))
-
     if [[ "$mtp_mode" != dspark ]]; then
         if [[ "$moe_mode" == megamoe ]]; then
             DEFAULT_ARGS+=(--moe-a2a-backend megamoe)
@@ -323,7 +383,6 @@ append_decode_parallel_args() {
         DEFAULT_ARGS+=(
             --dp "$dp_size"
             --enable-dp-attention
-            --dist-init-addr "127.0.0.1:$generic_dist_port"
         )
 
         # MTP_MODE=mtp already supplied the EAGLE configuration above.
@@ -335,7 +394,7 @@ append_decode_parallel_args() {
         )
     fi
 
-    [[ "$pd_open" != 1 ]] || append_pd_args decode "$pd_decode_dist_port"
+    [[ "$pd_open" != 1 ]] || append_pd_args decode
 }
 
 print_command() {
@@ -364,6 +423,7 @@ print_launch_profile() {
     echo "host=$the_host ip=$ip port=$port model=$model_path"
     echo "HCU_NUM=$tp_size PD_MODE=$pd_mode PD_OPEN=$pd_open MOE_MODE=$moe_mode"
     echo "MTP_MODE=$mtp_mode DSPARK_VARIANT=$dspark_variant DSPARK_MOE_MODE=$dspark_moe_mode"
+    echo "NNODES=$nnodes NODE_RANK=$node_rank DIST_INIT_ADDR=${dist_init_addr:-auto}"
 }
 
 if [[ "${1:-}" == -h || "${1:-}" == --help || "${HELP:-0}" == 1 ]]; then
@@ -373,9 +433,9 @@ fi
 
 port=${1:-30000}
 model_path=${2:-$DEFAULT_MODEL_PATH}
-rank_id=${3:-0}  # Kept for launcher compatibility.
+rank_id=${3:-0}  # Default multi-node rank; NODE_RANK can override it.
 host_arg=${4:-}
-ip=$(resolve_ip "$host_arg")
+ip=$(resolve_ip "$host_arg") || exit $?
 the_host=$(hostname)
 net_ifname=$(resolve_network_interface "$the_host")
 
@@ -385,6 +445,10 @@ fi
 
 is_int8=${IS_INT8:-0}
 is_fp8=${IS_FP8:-1}
+weight_load_threads=${WEIGHT_LOAD_THREADS:-64}
+weight_load_multithread=${WEIGHT_LOAD_MULTITHREAD:-1}
+weight_loader_prefetch=${WEIGHT_LOADER_PREFETCH:-0}
+weight_loader_prefetch_threads=${WEIGHT_LOADER_PREFETCH_THREADS:-4}
 deepep_mode=${DEEPEP_MODE:-auto}
 pd_mode=${PD_MODE:-none}
 pd_open=${PD_OPEN:-0}
@@ -400,9 +464,27 @@ dspark_pd_draft_moe_mode=${DSPARK_PD_DRAFT_MOE_MODE:-none}
 pd_bootstrap_port=${SGLANG_DISAGGREGATION_BOOTSTRAP_PORT:-8998}
 pd_prefill_dist_port=${PD_PREFILL_DIST_PORT:-6144}
 pd_decode_dist_port=${PD_DECODE_DIST_PORT:-6244}
+multi_node_dist_port=${DIST_INIT_PORT:-6245}
+nnodes=${NNODES:-2}
+node_rank=${NODE_RANK:-$rank_id}
+local_decode_dist_port=${DECODE_DIST_INIT_PORT:-$((port + 733))}
+tp_size=${HCU_NUM:-8}
+dp_size=$tp_size
+[[ "$tp_size" =~ ^[0-9]+$ ]] || die "HCU_NUM must be a positive integer (got: $tp_size)"
+(( tp_size > 0 )) || die "HCU_NUM must be a positive integer (got: $tp_size)"
+is_multi_node=0
+if (( tp_size > 8 )); then
+    is_multi_node=1
+    [[ "$nnodes" =~ ^[0-9]+$ ]] && (( nnodes >= 2 )) || die "NNODES must be an integer >= 2 (got: $nnodes)"
+    [[ "$node_rank" =~ ^[0-9]+$ ]] && (( node_rank < nnodes )) || die "NODE_RANK/RANK_ID must be in [0, $((nnodes - 1))] (got: $node_rank)"
+fi
 
 case "$pd_mode" in none|prefill|decode) ;; *) die "Invalid PD_MODE=$pd_mode (expected: none|prefill|decode)" ;; esac
 case "$mtp_mode" in none|dspark|mtp) ;; *) die "Invalid MTP_MODE=$mtp_mode (expected: none|dspark|mtp)" ;; esac
+case "$weight_load_multithread" in 0|1) ;; *) die "WEIGHT_LOAD_MULTITHREAD must be 0 or 1" ;; esac
+case "$weight_loader_prefetch" in 0|1) ;; *) die "WEIGHT_LOADER_PREFETCH must be 0 or 1" ;; esac
+[[ "$weight_load_threads" =~ ^[0-9]+$ ]] && (( weight_load_threads > 0 )) || die "WEIGHT_LOAD_THREADS must be a positive integer"
+[[ "$weight_loader_prefetch_threads" =~ ^[0-9]+$ ]] && (( weight_loader_prefetch_threads > 0 )) || die "WEIGHT_LOADER_PREFETCH_THREADS must be a positive integer"
 case "$dspark_moe_mode" in none|deepep) ;; *) die "Invalid DSPARK_MOE_MODE=$dspark_moe_mode (expected: none|deepep)" ;; esac
 case "$dspark_pd_draft_moe_mode" in none|deepep) ;; *) die "Invalid DSPARK_PD_DRAFT_MOE_MODE=$dspark_pd_draft_moe_mode (expected: none|deepep)" ;; esac
 [[ "$mtp_mode" == dspark || "$dspark_moe_mode" == none ]] || die "DSPARK_MOE_MODE=$dspark_moe_mode requires MTP_MODE=dspark"
@@ -427,10 +509,19 @@ rocshmem_env_vars=(
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
 )
 
+# Cross-node NCCL fabric selection. Required by ANY multi-node run, not just
+# PD: this host exposes mlx5_0..mlx5_9, and with no explicit list RCCL can
+# select mlx5_0/mlx5_1, which are not on the inter-node fabric. The first
+# cross-node all-reduce then fails with "remote process exited or there was a
+# network error". Verified on nmz20+nmz22: a 16-rank [32,7168] all-reduce
+# fails without this list and passes with it, everything else held equal.
+nccl_fabric_env_vars=(
+    "NCCL_IB_HCA=mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1"
+)
+
 pd_env_vars=(
     "MC_ENABLE_DEST_DEVICE_AFFINITY=1"
     "UCX_NET_DEVICES=mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1"
-    "NCCL_IB_HCA=mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1"
     "MC_ALLOWED_IBV_DEVICES=$IB_DEVICES"
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200"
 )
@@ -450,7 +541,7 @@ env_vars=(
     "SGLANG_USE_AITER_AG=0"                   # Use TP all-gather instead of AITER custom all-gather.
     "${rocshmem_env_vars[@]}"
     # MoE and GEMM kernel optimization.
-    "SGLANG_ROCM_USE_AITER_MOE=1"
+    "SGLANG_ROCM_USE_AITER_MOE=${SGLANG_ROCM_USE_AITER_MOE:-1}"
     "SGLANG_USE_OPT_CAT=1"
     "SGLANG_USE_FUSED_MLA_CAT=1"
     "SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT=$is_fp8"
@@ -474,6 +565,9 @@ env_vars=(
 
 # PD_MODE prefill/decode historically enables the DeepGEMM environment even
 # without PD_OPEN; retain that behavior while avoiding duplicate exports.
+if [[ "$pd_open" == 1 || "$pd_mode" != none ]] || (( is_multi_node )); then
+    env_vars+=("${nccl_fabric_env_vars[@]}")
+fi
 if [[ "$pd_open" == 1 || "$pd_mode" != none ]]; then
     env_vars+=("${pd_env_vars[@]}")
 fi
@@ -530,8 +624,7 @@ for kv in "${env_vars[@]}"; do
     echo "export $kv"
 done
 
-tp_size=${HCU_NUM:-8}
-dp_size=$tp_size
+dist_init_addr=$(resolve_dist_init_addr) || exit $?
 cuda_graph_max_bs=32
 mem_fraction_static=0.8
 if [[ "$mtp_mode" == dspark ]]; then
@@ -540,6 +633,7 @@ if [[ "$mtp_mode" == dspark ]]; then
 fi
 
 DEFAULT_ARGS=(
+    # --load-format fastsafetensors
     --reasoning-parser deepseek-v4
     --tool-call-parser deepseekv4
     --tp-size "$tp_size"
@@ -549,7 +643,7 @@ DEFAULT_ARGS=(
     --host 0.0.0.0
     --model-path "$model_path"
     --disable-radix-cache
-    --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}'
+    --model-loader-extra-config "{\"enable_multithread_load\": \"$([[ "$weight_load_multithread" == 1 ]] && echo true || echo false)\", \"num_threads\": $weight_load_threads}"
     --trust-remote-code
     --chunked-prefill-size 32768
     --disable-flashinfer-autotune
@@ -557,6 +651,17 @@ DEFAULT_ARGS=(
     --cuda-graph-max-bs "$cuda_graph_max_bs"
     --mem-fraction-static "$mem_fraction_static"
 )
+append_distributed_init_args
+
+if [[ "$weight_loader_prefetch" == 1 ]]; then
+    DEFAULT_ARGS+=(
+        --weight-loader-prefetch-checkpoints
+        --weight-loader-prefetch-num-threads "$weight_loader_prefetch_threads"
+    )
+    if [[ "$weight_load_multithread" == 1 ]]; then
+        echo "WARNING: checkpoint prefetch and multithread loading are both enabled; this is intended only for local-NVMe experiments."
+    fi
+fi
 
 case "$mtp_mode" in
     dspark) append_dspark_args ;;
