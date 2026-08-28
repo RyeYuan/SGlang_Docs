@@ -33,6 +33,8 @@ Core selectors:
   PD_MODE=none|prefill|decode
                             Select TP, prefill CP, or decode DP topology.
   PD_OPEN=0|1               Add PD disaggregation transport arguments.
+  PC_ENABLE=0|1             Enable radix cache. In PD decode mode this also
+                            enables the experimental DSV4 decode radix path.
   MOE_MODE=deepep|megamoe   Target MoE runtime selection (default: deepep).
   MTP_MODE=none|mtp|dspark  Speculative mode (default: none).
   IS_INT8=0|1               Enable SlimQuant INT8 loading.
@@ -99,6 +101,7 @@ Common DSpark overrides:
   DSPARK_SPS_TABLE_PATH=/path/to/sps.json
   DSPARK_CONFIDENCE_STS_PATH=/path/to/sts.json
   DSPARK_PD_DRAFT_MOE_MODE=none|deepep  (PD decode draft, default: none)
+  DSPARK_MEM_FRACTION_STATIC=FLOAT       (default: 0.957; PD decode + draft DeepEP: 0.90)
   DSPARK_BLOCK_SIZE=N
   DSPARK_MAX_RUNNING_REQUESTS=N
   DSPARK_CONTEXT_LENGTH=N
@@ -143,7 +146,7 @@ Examples:
     bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
   # DSpark PD D side, HCU 4-7
-  HIP_VISIBLE_DEVICES=4,5,6,7 HCU_NUM=4 PD_OPEN=1 PD_MODE=decode \
+  PC_ENABLE=1 HIP_VISIBLE_DEVICES=4,5,6,7 HCU_NUM=4 PD_OPEN=1 PD_MODE=decode \
     MTP_MODE=dspark DSPARK_MOE_MODE=deepep \
     bash run_dpsk-v4.sh 10016 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
@@ -443,6 +446,8 @@ if [[ "$the_host" == nmz26 ]]; then
     export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libibverbs:${LD_LIBRARY_PATH}
 fi
 
+pc_enable=${PC_ENABLE:-0}
+is_int4=${IS_INT4:-0}
 is_int8=${IS_INT8:-0}
 is_fp8=${IS_FP8:-1}
 weight_load_threads=${WEIGHT_LOAD_THREADS:-64}
@@ -610,6 +615,14 @@ if [[ "$mtp_mode" == dspark ]]; then
     fi
     [[ -z "${DSPARK_STS_COLLECT_PATH:-}" ]] || env_vars+=("SGLANG_DSPARK_STS_COLLECT_PATH=$DSPARK_STS_COLLECT_PATH")
 fi
+if [[ "$pc_enable" != 0 && "$pd_open" == 1 && "$pd_mode" == decode ]]; then
+    # DSV4 uses compressed KV plus SWA. Decode-side prefix reuse therefore
+    # requires the unified radix tree and the guarded DSV4 implementation.
+    env_vars+=(
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1"
+        "SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE=1"
+    )
+fi
 if [[ "$moe_mode" == megamoe ]]; then
     env_vars+=(
         "SGLANG_DCU_MEGA_MOE_RUNTIME=megamoe"
@@ -617,6 +630,7 @@ if [[ "$moe_mode" == megamoe ]]; then
         "SGLANG_DSV4_CHANNEL_FP8_SCALE=1"
     )
 fi
+[[ "$is_int4" != 1 ]] || env_vars+=("SGLANG_W4A8_TPMOE_BACKEND=triton")
 
 echo "---- Current Env Variables Setup ------"
 for kv in "${env_vars[@]}"; do
@@ -626,10 +640,10 @@ done
 
 dist_init_addr=$(resolve_dist_init_addr) || exit $?
 cuda_graph_max_bs=32
-mem_fraction_static=0.8
+mem_fraction_static=0.85
 if [[ "$mtp_mode" == dspark ]]; then
     cuda_graph_max_bs=${DSPARK_CUDA_GRAPH_MAX_BS:-32}
-    mem_fraction_static=${DSPARK_MEM_FRACTION_STATIC:-0.8}
+    mem_fraction_static=${DSPARK_MEM_FRACTION_STATIC:-0.90}
 fi
 
 DEFAULT_ARGS=(
@@ -642,7 +656,6 @@ DEFAULT_ARGS=(
     --port "$port"
     --host 0.0.0.0
     --model-path "$model_path"
-    --disable-radix-cache
     --model-loader-extra-config "{\"enable_multithread_load\": \"$([[ "$weight_load_multithread" == 1 ]] && echo true || echo false)\", \"num_threads\": $weight_load_threads}"
     --trust-remote-code
     --chunked-prefill-size 32768
@@ -671,7 +684,16 @@ case "$pd_mode" in
     prefill) append_prefill_parallel_args ;;
     decode) append_decode_parallel_args ;;
 esac
-[[ "$is_int8" != 1 ]] || DEFAULT_ARGS+=(--quantization slimquant_marlin)
+
+[[ "$is_int8" != 1 ]] || DEFAULT_ARGS+=(--quantization w8a8_int8)
+[[ "$is_int4" != 1 ]] || DEFAULT_ARGS+=(--quantization slimquant_marlin)
+# [[ "$is_int4" != 1 ]] || DEFAULT_ARGS+=(--moe-runner-backend aiter)
+
+[[ "$pc_enable" != 0 ]] || DEFAULT_ARGS+=(--disable-radix-cache)
+if [[ "$pc_enable" != 0 && "$pd_open" == 1 && "$pd_mode" == decode ]]; then
+    DEFAULT_ARGS+=(--disaggregation-decode-enable-radix-cache)
+fi
+
 
 FINAL_ARGS=("${DEFAULT_ARGS[@]}")
 print_launch_profile
