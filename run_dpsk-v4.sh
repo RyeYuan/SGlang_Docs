@@ -8,7 +8,7 @@
 set -o pipefail
 
 readonly DEEPEP_CONFIG=/home/proj_dpsk-v4/configs/deepep_IntraConfig.json
-readonly IB_DEVICES=mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9
+readonly IB_DEVICES=${IB_DEVICES:-mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9}
 readonly DEFAULT_MODEL_PATH=/parastor/home/public_user/wanglong/DeepSeek-V4-Flash-FP8-Channel
 
 die() {
@@ -50,7 +50,11 @@ Core selectors:
                             DSpark MoE runtime selection (default: none).
   DSPARK_VARIANT=static|compact-sps|compact-sps-sts
                             DSpark verify variant (default: static).
-  NNODES=N                    Multi-node count when HCU_NUM > 8 (default: 2).
+  PP_SIZE=N                   Prefill pipeline-parallel size. Standard prefill
+                            defaults to 2 for the PP2+CP8 two-node profile;
+                            set PP_SIZE=1 to keep the single-node CP profile.
+  NNODES=N                    Multi-node count when HCU_NUM > 8 or prefill PP > 1
+                            (default: 2).
   NODE_RANK=N                 Overrides positional RANK_ID.
   DIST_INIT_PORT=N            Generic multi-node init port (default: 6145).
   PD_PREFILL_DIST_PORT=N      PD P-side init port (default: 6144).
@@ -67,9 +71,9 @@ Distributed init-address precedence (exactly one --dist-init-addr is emitted):
 Parallel and test combinations:
   1. Pure TP
      PD_MODE=none, MTP_MODE=none
-  2. CP + EP prefill
+  2. PP2 + CP8 + EP prefill (two nodes when HCU_NUM=8)
      PD_MODE=prefill, MTP_MODE=none, MOE_MODE=deepep
-  3. CP + MegaMoE prefill
+  3. PP2 + CP8 + MegaMoE prefill (two nodes when HCU_NUM=8)
      PD_MODE=prefill, MTP_MODE=none, MOE_MODE=megamoe
   4. DP + EP + MTP decode
      PD_MODE=decode, MTP_MODE=mtp, MOE_MODE=deepep
@@ -82,10 +86,10 @@ Parallel and test combinations:
   8. DSpark PD decode: DP + EP target on the D side
      PD_OPEN=1, PD_MODE=decode, MTP_MODE=dspark
 
-Legacy note:
-  PP + TP and DP + TP existed only as commented snippets in the previous
-  script; they had no complete, validated parameter contract and are not
-  advertised as runnable profiles. Use a dedicated launcher if they are needed.
+Prefill PP note:
+  Standard prefill defaults to PP2+CP8 and therefore requires two nodes with
+  HCU_NUM=8. Set PP_SIZE=1 to run the single-node CP profile. PP2 prefill is
+  supported only with MTP_MODE=none; speculative/DSpark variants stay on PP1.
 
 DSpark variants (DSPARK_VARIANT, default: static):
   static              Static verify baseline.
@@ -111,11 +115,18 @@ Examples:
   # Pure TP
   bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
-  # CP + EP prefill
-  PD_MODE=prefill bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
+  # Single-node CP + EP prefill
+  PD_MODE=prefill PP_SIZE=1 \
+    bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
-  # CP + MegaMoE prefill
-  PD_MODE=prefill MOE_MODE=megamoe \
+  # PP2 + CP8 prefill across two nodes (run once per node with rank 0/1)
+  PD_MODE=prefill HCU_NUM=8 NNODES=2 NODE_RANK=0 \
+    bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel 0 node26
+  PD_MODE=prefill HCU_NUM=8 NNODES=2 NODE_RANK=1 \
+    bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel 1 node26
+
+  # Single-node CP + MegaMoE prefill
+  PD_MODE=prefill PP_SIZE=1 MOE_MODE=megamoe \
     bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
   # DP + EP + MTP decode
@@ -187,6 +198,8 @@ resolve_ip() {
         node20) echo 13.13.2.20 ;;
         node22) echo 13.13.2.22 ;;
         node26) echo 13.13.2.26 ;;
+        node104) echo 12.12.12.104 ;;
+        node110) echo 12.12.12.110 ;;
         sglang2) echo 10.16.1.33 ;;
         *) die "Invalid HOST=$host_arg (expected: node18|node20|node22|node26|sglang2)" ;;
     esac
@@ -195,6 +208,7 @@ resolve_ip() {
 resolve_network_interface() {
     case "$1" in
         nmz26|nmz20|nmz22|nmz18|nmz15) echo ens66f1np1 ;;
+        nmz104|nmz110) echo ens65f0np0;;
         sglang5) echo eth0 ;;
         sglang8) echo enp113s0f0np0 ;;
         sglang6) echo eth10 ;;
@@ -306,10 +320,14 @@ append_dspark_args() {
             --speculative-moe-a2a-backend none
         )
     else
+        if [[ "$pd_mode" != prefill ]]; then
+            DEFAULT_ARGS+=(
+                --dp "$dp_size"
+                --enable-dp-attention
+                --enable-dp-lm-head
+            )
+        fi
         DEFAULT_ARGS+=(
-            --dp "$dp_size"
-            --enable-dp-attention
-            --enable-dp-lm-head
             --ep "$tp_size"
         )
         if [[ "$dspark_moe_mode" == deepep ]]; then
@@ -372,6 +390,13 @@ append_prefill_parallel_args() {
         [[ "$mtp_mode" != dspark ]] || DEFAULT_ARGS+=(--moe-runner-backend deep_gemm)
     fi
 
+    if (( pp_size > 1 )); then
+        DEFAULT_ARGS+=(
+            --pp-size "$pp_size"
+            --disable-overlap-schedule
+        )
+    fi
+
     [[ "$pd_open" != 1 ]] || append_pd_args prefill
 }
 
@@ -424,7 +449,7 @@ print_command() {
 print_launch_profile() {
     echo "---- Launch Profile ------"
     echo "host=$the_host ip=$ip port=$port model=$model_path"
-    echo "HCU_NUM=$tp_size PD_MODE=$pd_mode PD_OPEN=$pd_open MOE_MODE=$moe_mode"
+    echo "HCU_NUM=$tp_size PP_SIZE=$pp_size PD_MODE=$pd_mode PD_OPEN=$pd_open MOE_MODE=$moe_mode"
     echo "MTP_MODE=$mtp_mode DSPARK_VARIANT=$dspark_variant DSPARK_MOE_MODE=$dspark_moe_mode"
     echo "NNODES=$nnodes NODE_RANK=$node_rank DIST_INIT_ADDR=${dist_init_addr:-auto}"
 }
@@ -475,10 +500,25 @@ node_rank=${NODE_RANK:-$rank_id}
 local_decode_dist_port=${DECODE_DIST_INIT_PORT:-$((port + 733))}
 tp_size=${HCU_NUM:-8}
 dp_size=$tp_size
+pp_size=${PP_SIZE:-1}
 [[ "$tp_size" =~ ^[0-9]+$ ]] || die "HCU_NUM must be a positive integer (got: $tp_size)"
 (( tp_size > 0 )) || die "HCU_NUM must be a positive integer (got: $tp_size)"
+[[ "$pp_size" =~ ^[0-9]+$ ]] || die "PP_SIZE must be a positive integer (got: $pp_size)"
+(( pp_size > 0 )) || die "PP_SIZE must be a positive integer (got: $pp_size)"
+
+# The standard (non-speculative) prefill profile is PP2+CP8. Keep the
+# speculative/DSpark prefill arms at PP1 because current SGLang validation
+# rejects pipeline parallelism together with speculative decoding.
+if [[ "$pd_mode" == prefill && "$mtp_mode" == none && -z "${PP_SIZE+x}" ]]; then
+    pp_size=2
+fi
+[[ "$pd_mode" == prefill || "$pp_size" == 1 ]] || \
+    die "PP_SIZE>1 is only supported for PD_MODE=prefill"
+[[ "$pp_size" == 1 || "$mtp_mode" == none ]] || \
+    die "PP_SIZE>1 requires MTP_MODE=none (PP is incompatible with speculative decoding)"
+
 is_multi_node=0
-if (( tp_size > 8 )); then
+if (( tp_size > 8 )) || [[ "$pd_mode" == prefill && "$pp_size" -gt 1 ]]; then
     is_multi_node=1
     [[ "$nnodes" =~ ^[0-9]+$ ]] && (( nnodes >= 2 )) || die "NNODES must be an integer >= 2 (got: $nnodes)"
     [[ "$node_rank" =~ ^[0-9]+$ ]] && (( node_rank < nnodes )) || die "NODE_RANK/RANK_ID must be in [0, $((nnodes - 1))] (got: $node_rank)"
@@ -556,7 +596,7 @@ env_vars=(
     # mHC and attention optimization.
     "SGLANG_ROCM_USE_AITER_TILELANG_MHC=1"
     "SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA=1"
-    "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=0"    # Sparse prefill does not support NSA CP.
+    "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=1"
     # Fused kernel optimization.
     "SGLANG_USE_LIGHTOP=1"
     "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE=1"

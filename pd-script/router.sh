@@ -17,14 +17,8 @@ else
         node22) p_ip="13.13.7.22" ;;
         node26) p_ip="10.16.1.26" ;;
         sglang2) p_ip="10.16.1.33" ;;
-        node36) p_ip="10.16.1.36" ;;
-        node39) p_ip="10.16.1.39" ;;
-        node42) p_ip="10.16.1.42" ;;
-        node43) p_ip="10.16.1.43" ;;
-        node46) p_ip="10.16.1.46" ;;
-        node51) p_ip="10.16.1.51" ;;
-        node54) p_ip="10.16.1.54" ;;
-        node55) p_ip="10.16.1.55" ;;
+        node104) p_ip="10.16.1.104" ;;
+        node110) p_ip="10.16.1.110" ;;
         *.*.*.*) p_ip="$prefill_node" ;;
         *)
             echo "Invalid host identifier: $prefill_node"
@@ -41,14 +35,8 @@ else
         node22) d_ip="10.16.1.22" ;;
         node26) d_ip="10.16.1.26" ;;
         sglang2) d_ip="10.16.1.33" ;;
-        node36) d_ip="10.16.1.36" ;;
-        node39) d_ip="10.16.1.39" ;;
-        node42) d_ip="10.16.1.42" ;;
-        node43) d_ip="10.16.1.43" ;;
-        node46) d_ip="10.16.1.46" ;;
-        node51) d_ip="10.16.1.51" ;;
-        node54) d_ip="10.16.1.54" ;;
-        node55) d_ip="10.16.1.55" ;;
+        node104) d_ip="10.16.1.104" ;;
+        node110) d_ip="10.16.1.110" ;;
         *.*.*.*) d_ip="$decode_node" ;;
         *)
             echo "Invalid host identifier: $decode_node"
