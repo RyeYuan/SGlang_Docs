@@ -46,7 +46,7 @@ Core selectors:
                             Prefetch disjoint checkpoint shards into each node's page cache.
   WEIGHT_LOADER_PREFETCH_THREADS=N
                             Prefetch threads per local rank (default: 4).
-  DSPARK_MOE_MODE=none|deepep
+  DSPARK_MOE_MODE=none|deepep|megamoe
                             DSpark MoE runtime selection (default: none).
   DSPARK_VARIANT=static|compact-sps|compact-sps-sts
                             DSpark verify variant (default: static).
@@ -85,6 +85,9 @@ Parallel and test combinations:
      PD_OPEN=1, PD_MODE=prefill, MTP_MODE=dspark
   8. DSpark PD decode: DP + EP target on the D side
      PD_OPEN=1, PD_MODE=decode, MTP_MODE=dspark
+  9. DSpark PD decode with MegaMoE target/draft on the D side
+     PD_OPEN=1, PD_MODE=decode, MTP_MODE=dspark,
+     DSPARK_MOE_MODE=megamoe, DSPARK_PD_DRAFT_MOE_MODE=megamoe
 
 Prefill PP note:
   Standard prefill defaults to PP2+CP8 and therefore requires two nodes with
@@ -104,7 +107,8 @@ DSpark variants (DSPARK_VARIANT, default: static):
 Common DSpark overrides:
   DSPARK_SPS_TABLE_PATH=/path/to/sps.json
   DSPARK_CONFIDENCE_STS_PATH=/path/to/sts.json
-  DSPARK_PD_DRAFT_MOE_MODE=none|deepep  (PD decode draft, default: none)
+  DSPARK_PD_DRAFT_MOE_MODE=none|deepep|megamoe
+                            PD decode draft MoE backend (default: none).
   DSPARK_MEM_FRACTION_STATIC=FLOAT       (default: 0.957; PD decode + draft DeepEP: 0.90)
   DSPARK_BLOCK_SIZE=N
   DSPARK_MAX_RUNNING_REQUESTS=N
@@ -156,9 +160,15 @@ Examples:
     MTP_MODE=dspark DSPARK_MOE_MODE=deepep \
     bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
-  # DSpark PD D side, HCU 4-7
+  # DSpark PD D side, HCU 4-7 (DeepEP target/draft)
   PC_ENABLE=1 HIP_VISIBLE_DEVICES=4,5,6,7 HCU_NUM=4 PD_OPEN=1 PD_MODE=decode \
     MTP_MODE=dspark DSPARK_MOE_MODE=deepep \
+    bash run_dpsk-v4.sh 10016 /module/DeepSeek-V4-Flash-0731-FP8-Channel
+
+  # DSpark PD D side with MegaMoE target and draft
+  PC_ENABLE=1 HIP_VISIBLE_DEVICES=4,5,6,7 HCU_NUM=4 PD_OPEN=1 PD_MODE=decode \
+    MTP_MODE=dspark DSPARK_MOE_MODE=megamoe \
+    DSPARK_PD_DRAFT_MOE_MODE=megamoe \
     bash run_dpsk-v4.sh 10016 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
   # INT8 pure TP
@@ -199,6 +209,7 @@ resolve_ip() {
         node22) echo 13.13.2.22 ;;
         node26) echo 13.13.2.26 ;;
         node104) echo 12.12.12.104 ;;
+        node107) echo 12.12.12.107 ;;
         node110) echo 12.12.12.110 ;;
         sglang2) echo 10.16.1.33 ;;
         *) die "Invalid HOST=$host_arg (expected: node18|node20|node22|node26|sglang2)" ;;
@@ -208,7 +219,7 @@ resolve_ip() {
 resolve_network_interface() {
     case "$1" in
         nmz26|nmz20|nmz22|nmz18|nmz15) echo ens66f1np1 ;;
-        nmz104|nmz110) echo ens65f0np0;;
+        nmz107|nmz104|nmz110) echo ens65f0np0;;
         sglang5) echo eth0 ;;
         sglang8) echo enp113s0f0np0 ;;
         sglang6) echo eth10 ;;
@@ -307,8 +318,8 @@ append_dspark_args() {
         --speculative-draft-model-path "$dspark_draft_model_path"
         --speculative-num-steps 1
         --speculative-eagle-topk 1
-        --max-running-requests "${DSPARK_MAX_RUNNING_REQUESTS:-32}"
-        --context-length "${DSPARK_CONTEXT_LENGTH:-32768}"
+        # --max-running-requests "${DSPARK_MAX_RUNNING_REQUESTS:-32}"
+        # --context-length "${DSPARK_CONTEXT_LENGTH:-32768}"
     )
 
     # PD prefill uses target CP+DeepEP/DeepGEMM, but the draft only injects
@@ -316,7 +327,13 @@ append_dspark_args() {
     if [[ "$pd_open" == 1 && "$pd_mode" == prefill ]]; then
         DEFAULT_ARGS+=(
             --disable-cuda-graph
-            --max-total-tokens "${DSPARK_PD_PREFILL_MAX_TOTAL_TOKENS:-131072}"
+            # --max-total-tokens "${DSPARK_PD_PREFILL_MAX_TOTAL_TOKENS:-131072}"
+            # DSpark PD transfers one complete target-hidden/KV span to D.
+            # Keeping the framework default (16K) turns a >16K prompt into
+            # partial prefill chunks, for which D otherwise waits forever for
+            # the unfinished transfer.  Make the safety limit explicit and
+            # independently configurable for long-context PD serving.
+            # --max-prefill-tokens "${DSPARK_PD_PREFILL_MAX_PREFILL_TOKENS:-16384}"
             --speculative-moe-a2a-backend none
         )
     else
@@ -330,25 +347,72 @@ append_dspark_args() {
         DEFAULT_ARGS+=(
             --ep "$tp_size"
         )
-        if [[ "$dspark_moe_mode" == deepep ]]; then
-            append_deepep_args
-            if [[ "$pd_open" == 1 && "$pd_mode" == decode && "$dspark_pd_draft_moe_mode" == none ]]; then
-                # Match H20: keep one DeepEP/DeepGEMM target runtime and
-                # execute the DSpark draft through the standalone path.
-                DEFAULT_ARGS+=(
-                    --speculative-moe-a2a-backend none
-                    --speculative-moe-runner-backend triton
-                )
-            else
-                DEFAULT_ARGS+=(
-                    --speculative-moe-a2a-backend deepep
-                    --speculative-moe-runner-backend deep_gemm
-                )
-            fi
-            DEFAULT_ARGS+=(--moe-runner-backend deep_gemm)
-        else
-            DEFAULT_ARGS+=(--moe-a2a-backend none)
-        fi
+        case "$dspark_moe_mode" in
+            deepep)
+                append_deepep_args
+                case "$dspark_pd_draft_moe_mode" in
+                    none)
+                        # Match H20: keep one DeepEP/DeepGEMM target runtime
+                        # and execute the DSpark draft through the standalone path.
+                        DEFAULT_ARGS+=(
+                            --speculative-moe-a2a-backend none
+                            --speculative-moe-runner-backend triton
+                        )
+                        ;;
+                    deepep)
+                        DEFAULT_ARGS+=(
+                            --speculative-moe-a2a-backend deepep
+                            --speculative-moe-runner-backend deep_gemm
+                        )
+                        ;;
+                    megamoe)
+                        # MegaMoE selects the draft A2A implementation.  Its
+                        # runner is resolved by the framework (normally auto),
+                        # so do not force a DeepGEMM runner for the draft.
+                        DEFAULT_ARGS+=(--speculative-moe-a2a-backend megamoe)
+                        ;;
+                esac
+                DEFAULT_ARGS+=(--moe-runner-backend deep_gemm)
+                ;;
+            megamoe)
+                # MegaMoE supplies its own runtime and does not need the
+                # target --moe-runner-backend deep_gemm override.
+                DEFAULT_ARGS+=(--moe-a2a-backend megamoe)
+                case "$dspark_pd_draft_moe_mode" in
+                    none)
+                        DEFAULT_ARGS+=(
+                            --speculative-moe-a2a-backend none
+                            --speculative-moe-runner-backend triton
+                        )
+                        ;;
+                    deepep)
+                        DEFAULT_ARGS+=(
+                            --speculative-moe-a2a-backend deepep
+                            --speculative-moe-runner-backend deep_gemm
+                        )
+                        ;;
+                    megamoe)
+                        DEFAULT_ARGS+=(--speculative-moe-a2a-backend megamoe)
+                        ;;
+                esac
+                ;;
+            none)
+                DEFAULT_ARGS+=(--moe-a2a-backend none)
+                case "$dspark_pd_draft_moe_mode" in
+                    deepep)
+                        DEFAULT_ARGS+=(
+                            --speculative-moe-a2a-backend deepep
+                            --speculative-moe-runner-backend deep_gemm
+                        )
+                        ;;
+                    megamoe)
+                        DEFAULT_ARGS+=(--speculative-moe-a2a-backend megamoe)
+                        ;;
+                    none)
+                        ;;
+                esac
+                ;;
+        esac
     fi
 
     append_dspark_variant_args
@@ -384,7 +448,7 @@ append_prefill_parallel_args() {
             --cp-strategy interleave
             --dp 1
             --attn-cp-size "$tp_size"
-            --enable-dp-attention
+            # --enable-dp-attention
         )
         append_deepep_args
         [[ "$mtp_mode" != dspark ]] || DEFAULT_ARGS+=(--moe-runner-backend deep_gemm)
@@ -471,6 +535,7 @@ if [[ "$the_host" == nmz26 ]]; then
     export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libibverbs:${LD_LIBRARY_PATH}
 fi
 
+chunk_size=${CHUNK_SIZE:-32768}
 pc_enable=${PC_ENABLE:-0}
 is_int4=${IS_INT4:-0}
 is_int8=${IS_INT8:-0}
@@ -530,8 +595,8 @@ case "$weight_load_multithread" in 0|1) ;; *) die "WEIGHT_LOAD_MULTITHREAD must 
 case "$weight_loader_prefetch" in 0|1) ;; *) die "WEIGHT_LOADER_PREFETCH must be 0 or 1" ;; esac
 [[ "$weight_load_threads" =~ ^[0-9]+$ ]] && (( weight_load_threads > 0 )) || die "WEIGHT_LOAD_THREADS must be a positive integer"
 [[ "$weight_loader_prefetch_threads" =~ ^[0-9]+$ ]] && (( weight_loader_prefetch_threads > 0 )) || die "WEIGHT_LOADER_PREFETCH_THREADS must be a positive integer"
-case "$dspark_moe_mode" in none|deepep) ;; *) die "Invalid DSPARK_MOE_MODE=$dspark_moe_mode (expected: none|deepep)" ;; esac
-case "$dspark_pd_draft_moe_mode" in none|deepep) ;; *) die "Invalid DSPARK_PD_DRAFT_MOE_MODE=$dspark_pd_draft_moe_mode (expected: none|deepep)" ;; esac
+case "$dspark_moe_mode" in none|deepep|megamoe) ;; *) die "Invalid DSPARK_MOE_MODE=$dspark_moe_mode (expected: none|deepep|megamoe)" ;; esac
+case "$dspark_pd_draft_moe_mode" in none|deepep|megamoe) ;; *) die "Invalid DSPARK_PD_DRAFT_MOE_MODE=$dspark_pd_draft_moe_mode (expected: none|deepep|megamoe)" ;; esac
 [[ "$mtp_mode" == dspark || "$dspark_moe_mode" == none ]] || die "DSPARK_MOE_MODE=$dspark_moe_mode requires MTP_MODE=dspark"
 
 if [[ "$mtp_mode" == dspark ]]; then
@@ -548,10 +613,11 @@ if [[ "$mtp_mode" == dspark ]]; then
 fi
 
 rocshmem_env_vars=(
-    "ROCSHMEM_DISABLE_HDP_FLUSH=1"
-    "ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX=288"
-    "ROCSHMEM_HEAP_SIZE=3173741824"
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
+    # "ROCSHMEM_DISABLE_HDP_FLUSH=1"
+    # "ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX=288"
+    # "ROCSHMEM_HEAP_SIZE=3173741824"
+    "ROCSHMEM_MAX_NUM_CONTEXTS=48"
+    # "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
 )
 
 # Cross-node NCCL fabric selection. Required by ANY multi-node run, not just
@@ -569,6 +635,7 @@ pd_env_vars=(
     "UCX_NET_DEVICES=mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1"
     "MC_ALLOWED_IBV_DEVICES=$IB_DEVICES"
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200"
+    "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1"
 )
 
 env_vars=(
@@ -577,13 +644,14 @@ env_vars=(
     "NCCL_MIN_NCHANNELS=16"
     "NCCL_MAX_NCHANNELS=16"
     "SGLANG_TORCH_PROFILER_DIR=/home/proj_dpsk-v4/profile"
-    "SGLANG_OPT_USE_FUSED_STORE_CACHE=false"  # Can be enabled, but accuracy drops significantly.
+    # "SGLANG_OPT_USE_FUSED_STORE_CACHE=false"  # Can be enabled, but accuracy drops significantly.
     "SGLANG_OPT_USE_FUSED_HASH_TOPK=true"
     "SGLANG_OPT_SWIGLU_CLAMP_FUSION=false"    # CUDA-only fused kernel; keep disabled on HIP.
     "SGLANG_TOPK_TRANSFORM_512_TORCH=false"
     "SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=true"
     "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"
     "SGLANG_USE_AITER_AG=0"                   # Use TP all-gather instead of AITER custom all-gather.
+    "SGLANG_SET_CPU_AFFINITY=1"
     "${rocshmem_env_vars[@]}"
     # MoE and GEMM kernel optimization.
     "SGLANG_ROCM_USE_AITER_MOE=${SGLANG_ROCM_USE_AITER_MOE:-1}"
@@ -606,6 +674,8 @@ env_vars=(
     "SGLANG_USE_LIGHTOP_EP_SCATTER=1"
     "SGLANG_USE_LIGHTOP_EP_GATHER=1"
     "SGLANG_USE_LIGHTOP_TOPK_IDS_POSTPROCESS=1"
+    "SGLANG_LIGHTOP_KVALLOC_KERNEL=1"
+    "SGLANG_LIGHTOP_TOPK=1"
 )
 
 # PD_MODE prefill/decode historically enables the DeepGEMM environment even
@@ -640,7 +710,7 @@ if [[ "$mtp_mode" == dspark ]]; then
         "SGLANG_DSPARK_FAST_KERNEL=${DSPARK_FAST_KERNEL:-1}"
         "SGLANG_DSPARK_FAST_SAMPLING=${DSPARK_FAST_SAMPLING:-1}"
     )
-    if [[ "$dspark_moe_mode" == deepep ]]; then
+    if [[ "$dspark_moe_mode" == deepep || "$dspark_pd_draft_moe_mode" == deepep ]]; then
         env_vars+=(
             "SGLANG_USE_FP8_W8A8_MOE=$is_fp8"
             "SGLANG_USE_DEEPGEMM_MOE=1"
@@ -663,10 +733,10 @@ if [[ "$pc_enable" != 0 && "$pd_open" == 1 && "$pd_mode" == decode ]]; then
         "SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE=1"
     )
 fi
-if [[ "$moe_mode" == megamoe ]]; then
+if [[ "$moe_mode" == megamoe || "$dspark_moe_mode" == megamoe || "$dspark_pd_draft_moe_mode" == megamoe ]]; then
     env_vars+=(
-        "SGLANG_DCU_MEGA_MOE_RUNTIME=megamoe"
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"
+        "SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=$((chunk_size / tp_size))"
         "SGLANG_DSV4_CHANNEL_FP8_SCALE=1"
     )
 fi
@@ -680,10 +750,10 @@ done
 
 dist_init_addr=$(resolve_dist_init_addr) || exit $?
 cuda_graph_max_bs=32
-mem_fraction_static=0.85
+mem_fraction_static=0.8
 if [[ "$mtp_mode" == dspark ]]; then
     cuda_graph_max_bs=${DSPARK_CUDA_GRAPH_MAX_BS:-32}
-    mem_fraction_static=${DSPARK_MEM_FRACTION_STATIC:-0.90}
+    mem_fraction_static=${DSPARK_MEM_FRACTION_STATIC:-0.75}
 fi
 
 DEFAULT_ARGS=(
@@ -698,11 +768,14 @@ DEFAULT_ARGS=(
     --model-path "$model_path"
     --model-loader-extra-config "{\"enable_multithread_load\": \"$([[ "$weight_load_multithread" == 1 ]] && echo true || echo false)\", \"num_threads\": $weight_load_threads}"
     --trust-remote-code
-    --chunked-prefill-size 32768
+    --chunked-prefill-size $chunk_size
     --disable-flashinfer-autotune
     --skip-server-warmup
-    --cuda-graph-max-bs "$cuda_graph_max_bs"
+    # --cuda-graph-max-bs "$cuda_graph_max_bs"
+    --kv-cache-dtype auto
     --mem-fraction-static "$mem_fraction_static"
+    --swa-full-tokens-ratio 0.55
+    --tokenizer-worker-num "${TOKENIZER_WORKER_NUM:-8}"
 )
 append_distributed_init_args
 
