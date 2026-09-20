@@ -7,6 +7,8 @@
 
 set -o pipefail
 
+export PYTHONPATH=/home/proj_sglang_fork/sglang-das/python:${PYTHONPATH:-}
+
 readonly DEEPEP_CONFIG=/home/proj_dpsk-v4/configs/deepep_IntraConfig.json
 readonly IB_DEVICES=${IB_DEVICES:-mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9}
 readonly DEFAULT_MODEL_PATH=/parastor/home/public_user/wanglong/DeepSeek-V4-Flash-FP8-Channel
@@ -326,7 +328,6 @@ append_dspark_args() {
     # target hidden KV and must not initialize the decode-side DP/LM-head path.
     if [[ "$pd_open" == 1 && "$pd_mode" == prefill ]]; then
         DEFAULT_ARGS+=(
-            --disable-cuda-graph
             # --max-total-tokens "${DSPARK_PD_PREFILL_MAX_TOTAL_TOKENS:-131072}"
             # DSpark PD transfers one complete target-hidden/KV span to D.
             # Keeping the framework default (16K) turns a >16K prompt into
@@ -336,6 +337,9 @@ append_dspark_args() {
             # --max-prefill-tokens "${DSPARK_PD_PREFILL_MAX_PREFILL_TOKENS:-16384}"
             --speculative-moe-a2a-backend none
         )
+        if [[ "$bcg_enable" == 0 ]]; then
+            DEFAULT_ARGS+=(--disable-cuda-graph)
+        fi
     else
         if [[ "$pd_mode" != prefill ]]; then
             DEFAULT_ARGS+=(
@@ -571,6 +575,8 @@ pp_size=${PP_SIZE:-1}
 [[ "$pp_size" =~ ^[0-9]+$ ]] || die "PP_SIZE must be a positive integer (got: $pp_size)"
 (( pp_size > 0 )) || die "PP_SIZE must be a positive integer (got: $pp_size)"
 
+bcg_enable=${BCG_ENABLE:-0}
+
 # The standard (non-speculative) prefill profile is PP2+CP8. Keep the
 # speculative/DSpark prefill arms at PP1 because current SGLang validation
 # rejects pipeline parallelism together with speculative decoding.
@@ -771,7 +777,7 @@ DEFAULT_ARGS=(
     --chunked-prefill-size $chunk_size
     --disable-flashinfer-autotune
     --skip-server-warmup
-    # --cuda-graph-max-bs "$cuda_graph_max_bs"
+    --cuda-graph-max-bs "$cuda_graph_max_bs"
     --kv-cache-dtype auto
     --mem-fraction-static "$mem_fraction_static"
     --swa-full-tokens-ratio 0.55
@@ -807,6 +813,45 @@ if [[ "$pc_enable" != 0 && "$pd_open" == 1 && "$pd_mode" == decode ]]; then
     DEFAULT_ARGS+=(--disaggregation-decode-enable-radix-cache)
 fi
 
+if [[ "$bcg_enable" == 1 ]]; then
+    # Prefill breakable CUDA graph (BCG).
+    #   BCG_MAX_TOKENS  largest captured token count when BCG_BUCKETS is empty; the
+    #                   framework fills in the buckets below it (step 16 up to 256,
+    #                   32 up to 512, 64 up to 1024, 256 up to 4096). A batch replays
+    #                   on the smallest bucket >= its new-token count (at most 2x
+    #                   padding) and runs eagerly above the largest bucket.
+    #                   P-side default 2048: on 8-card PD (CP8 + DeepEP) eager
+    #                   prefill is host-launch bound (~217 ms, flat) up to ~2048 new
+    #                   tokens per batch and graphs cut that to 130-196 ms; from
+    #                   ~4096 tokens the GPU is the bottleneck and graphs stop helping.
+    #   BCG_BUCKETS     explicit bucket list (space/comma separated), overrides
+    #                   BCG_MAX_TOKENS.
+    DEFAULT_ARGS+=(--cuda-graph-backend-prefill breakable)
+    if [[ -n "${BCG_BUCKETS:-}" ]]; then
+        read -r -a bcg_bucket_list <<< "${BCG_BUCKETS//,/ }"
+        DEFAULT_ARGS+=(--cuda-graph-bs-prefill "${bcg_bucket_list[@]}")
+    else
+        bcg_default_max_tokens=256
+        [[ "$pd_mode" != prefill ]] || bcg_default_max_tokens=2048
+        DEFAULT_ARGS+=(--cuda-graph-max-bs-prefill "${BCG_MAX_TOKENS:-$bcg_default_max_tokens}")
+    fi
+    if [[ "$pd_mode" == prefill && "$pp_size" == 1 ]]; then
+        # Prefill CP (interleave) replays BCG only through the CP-v2 runner, which
+        # shards inputs outside the model body; the legacy in-model DSA CP split
+        # keeps every CP prefill batch eager ("cuda graph: False").
+        export SGLANG_ENABLE_CP_V2=1
+        echo "export SGLANG_ENABLE_CP_V2=1  # BCG_ENABLE=1, PD_MODE=prefill"
+        # Captured DSV4 attention metadata is otherwise sized for the full model
+        # context (1M) and rebuilt at that width on every replay, which made BCG
+        # up to 24% slower than eager. Batches with a longer context replay eagerly.
+        #   BCG_MAX_CONTEXT  context bound for graph replay (default 16384, 0 = off)
+        bcg_max_context=${BCG_MAX_CONTEXT:-16384}
+        if [[ "$bcg_max_context" != 0 ]]; then
+            export SGLANG_BCG_PREFILL_MAX_CONTEXT=$bcg_max_context
+            echo "export SGLANG_BCG_PREFILL_MAX_CONTEXT=$bcg_max_context"
+        fi
+    fi
+fi
 
 FINAL_ARGS=("${DEFAULT_ARGS[@]}")
 print_launch_profile
