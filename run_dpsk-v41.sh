@@ -51,7 +51,7 @@ Core selectors:
                             0  Same topology, standalone: the P or D profile
                                runs on its own with no transfer arguments.
                             Requires PD_MODE=prefill or PD_MODE=decode.
-  MOE_MODE=none|deepep|megamoe
+  MOE_MODE=none|triton|deepep|megamoe
                             MoE runtime for the P/D paths (default: deepep when
                             PD_MODE is set, none otherwise). P/D paths require
                             deepep or megamoe.
@@ -129,6 +129,7 @@ resolve_ip() {
         node22) echo 13.13.2.22 ;;
         node26) echo 13.13.2.26 ;;
         node104) echo 12.12.12.104 ;;
+        node105) echo 12.12.12.105 ;;
         node107) echo 12.12.12.107 ;;
         node110) echo 12.12.12.110 ;;
         sglang2) echo 10.16.1.33 ;;
@@ -138,8 +139,8 @@ resolve_ip() {
 
 resolve_network_interface() {
     case "$1" in
-        nmz26|nmz20|nmz22|nmz18|nmz15) echo ens66f1np1 ;;
-        nmz107|nmz104|nmz110) echo ens65f0np0 ;;
+        nmz26|nmz20|nmz22|nmz18|nmz15|nmz21|nmz7|nmz28) echo ens66f1np1 ;;
+        nmz105|nmz107|nmz104|nmz110) echo ens65f0np0 ;;
         sglang5) echo eth0 ;;
         sglang8) echo enp113s0f0np0 ;;
         sglang6) echo eth10 ;;
@@ -154,7 +155,6 @@ require_file() {
 append_deepep_args() {
     DEFAULT_ARGS+=(
         --moe-a2a-backend deepep
-        --deepep-mode auto
         --deepep-config "$DEEPEP_CONFIG"
     )
 }
@@ -208,23 +208,38 @@ append_prefill_args() {
         --attn-cp-size "$tp_size"
     )
     case "$moe_mode" in
-        none)
+        none|triton)
             DEFAULT_ARGS+=(
                 --moe-runner-backend triton
                 --speculative-moe-a2a-backend none
                 --speculative-moe-runner-backend triton
             )
             ;;
+        aiter)
+            DEFAULT_ARGS+=(
+                --moe-runner-backend aiter
+                --speculative-moe-a2a-backend none
+                --speculative-moe-runner-backend triton
+            )
+            ;;            
         deepep)
             append_deepep_args
             DEFAULT_ARGS+=(
+                --deepep-mode normal 
                 --moe-runner-backend deep_gemm
-                --speculative-moe-a2a-backend none
+                --speculative-moe-a2a-backend deepep
                 --speculative-moe-runner-backend triton
             )
             ;;
         megamoe)
             DEFAULT_ARGS+=(--moe-a2a-backend megamoe)
+            ;;
+        humming)
+            append_deepep_args
+            DEFAULT_ARGS+=(
+                --moe-runner-backend humming
+                --deepep-dispatcher-output-dtype fp8
+                )
             ;;
     esac
     [[ -z "${MAX_PREFILL_TOKENS:-}" ]] || DEFAULT_ARGS+=(--max-prefill-tokens "$MAX_PREFILL_TOKENS")
@@ -240,16 +255,24 @@ append_decode_args() {
         --ep "$tp_size"
     )
     case "$moe_mode" in
-        none)
+        none|triton)
             DEFAULT_ARGS+=(
                 --moe-runner-backend triton
                 --speculative-moe-a2a-backend none
                 --speculative-moe-runner-backend triton
             )
             ;;
+        aiter)
+            DEFAULT_ARGS+=(
+                --moe-runner-backend aiter
+                --speculative-moe-a2a-backend none
+                --speculative-moe-runner-backend triton
+            )
+            ;;            
         deepep)
             append_deepep_args
             DEFAULT_ARGS+=(
+                --deepep-mode auto
                 --moe-runner-backend deep_gemm
                 --speculative-moe-a2a-backend none
                 --speculative-moe-runner-backend triton
@@ -258,6 +281,12 @@ append_decode_args() {
         megamoe)
             DEFAULT_ARGS+=(--moe-a2a-backend megamoe)
             ;;
+        humming)
+            DEFAULT_ARGS+=(
+                --moe-runner-backend humming
+                --deepep-dispatcher-output-dtype fp8
+                )
+            ;;            
     esac
     [[ "$pd_open" != 1 ]] || append_pd_args decode
 }
@@ -333,7 +362,7 @@ local_decode_dist_port=${DECODE_DIST_INIT_PORT:-$((port + 733))}
 [[ "$dspark_block_size" =~ ^[0-9]+$ ]] && (( dspark_block_size > 0 )) || die "DSPARK_BLOCK_SIZE must be a positive integer (got: $dspark_block_size)"
 [[ "$max_running_requests" =~ ^[0-9]+$ ]] && (( max_running_requests > 0 )) || die "MAX_RUNNING_REQUESTS must be a positive integer (got: $max_running_requests)"
 case "$pd_mode" in none|prefill|decode) ;; *) die "Invalid PD_MODE=$pd_mode (expected: none|prefill|decode)" ;; esac
-case "$moe_mode" in none|deepep|megamoe) ;; *) die "Invalid MOE_MODE=$moe_mode (expected: none|deepep|megamoe)" ;; esac
+case "$moe_mode" in none|triton|aiter|deepep|megamoe|humming) ;; *) die "Invalid MOE_MODE=$moe_mode (expected: none|triton|aiter|deepep|megamoe|humming)" ;; esac
 case "$pc_enable" in 0|1) ;; *) die "PC_ENABLE must be 0 or 1" ;; esac
 case "$pd_open" in 0|1) ;; *) die "PD_OPEN must be 0 or 1" ;; esac
 if [[ "$pd_open" == 1 && "$pd_mode" == none ]]; then
@@ -357,15 +386,16 @@ env_vars=(
     "SGLANG_TORCH_PROFILER_DIR=/home/proj_dpsk-v4/profile"
     "SGLANG_OPT_SWIGLU_CLAMP_FUSION=false"
     "SGLANG_USE_AITER_AG=0"
-    "SGLANG_ROCM_USE_AITER_MOE=${SGLANG_ROCM_USE_AITER_MOE:-0}"
     "SGLANG_USE_LIGHTOP=1"
     "SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT=1"
-    "SGLANG_USE_FP8_W8A8_MOE=1"
     "SGLANG_USE_DEEPGEMM_MOE=1"
     "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE=1"
     "SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM=1"
     "SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA=1"
     "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=1"
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
+    # opt args
+    "SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4=1" # default as 1, need to confirm
 )
 
 # Cross-node NCCL fabric selection. Required by ANY multi-node run, not just
@@ -398,10 +428,32 @@ if [[ "$pc_enable" == 1 && "$pd_open" == 1 && "$pd_mode" == decode ]]; then
         "SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE=1"
     )
 fi
-if [[ "$moe_mode" == megamoe ]]; then
+case "${moe_mode:-}" in
+    triton|none)
+        env_vars+=("SGLANG_ROCM_USE_AITER_MOE=0")
+        ;;
+    aiter)
+        env_vars+=("SGLANG_USE_FP8_W8A8_MOE=0" "SGLANG_ROCM_USE_AITER_MOE=0")
+        ;;
+    deepep)
+        env_vars+=("SGLANG_USE_FP8_W8A8_MOE=1")
+        ;;
+    megamoe)
+        env_vars+=(
+            "SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
+            "SGLANG_DSV4_CHANNEL_FP8_SCALE=1"
+        )
+        ;;
+    humming)
+        env_vars+=(
+            'SGLANG_HUMMING_INPUT_QUANT_CONFIG={"dtype": "float8e4m3", "group_size": 128}'
+        )
+        ;;
+esac
+
+if [[ "$pd_mode" == decode ]]; then
     env_vars+=(
-        "SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
-        "SGLANG_DSV4_CHANNEL_FP8_SCALE=1"
+        "ROCBLAS_TENSILE_LIBPATH=/home/proj_dpsk-v4/configs/dpsk-v41-dp8ep8-lib"
     )
 fi
 
@@ -431,12 +483,18 @@ DEFAULT_ARGS=(
     --speculative-dspark-block-size "$dspark_block_size"
     --reasoning-parser auto
     --tool-call-parser auto
+    # opt args
+    # --enable-dsa-cache-layer-split # enable it only prefill CP + DSA 模型 + PD 的 P 端 + KV 显存确实是瓶颈
+    # --enable-cp-decode-attn-tp # work only on IFB mode
 )
 append_distributed_init_args
 
 # The original standalone profile runs the MoE through the triton runner;
 # the P/D paths select explicit target and draft MoE backends per MOE_MODE.
-[[ "$pd_mode" != none ]] || DEFAULT_ARGS+=(--moe-runner-backend triton)
+if [[ "$pd_mode" == none ]]; then
+    DEFAULT_ARGS+=(--moe-runner-backend $moe_mode)
+    [[ "$moe_mode" != aiter ]] || DEFAULT_ARGS+=(--speculative-moe-runner-backend triton)
+fi
 
 case "$pd_mode" in
     prefill) append_prefill_args ;;

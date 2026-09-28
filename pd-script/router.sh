@@ -13,9 +13,12 @@ if [[ -z "$prefill_node" ]]; then
     p_ip="$(hostname -I | awk '{print $1}')"
 else
     case "$prefill_node" in
+        node7) p_ip="13.13.7.7" ;;
         node20) p_ip="13.13.7.20" ;;
+        node21) p_ip="13.13.7.21" ;;
         node22) p_ip="13.13.7.22" ;;
         node26) p_ip="10.16.1.26" ;;
+        node28) p_ip="10.16.1.28" ;;
         sglang2) p_ip="10.16.1.33" ;;
         node104) p_ip="12.12.12.104" ;;
         node107) p_ip="12.12.12.107" ;;
@@ -32,9 +35,12 @@ if [[ -z "$decode_node" ]]; then
     d_ip="$(hostname -I | awk '{print $1}')"
 else
     case "$decode_node" in
-        node20) d_ip="10.16.1.20" ;;
-        node22) d_ip="10.16.1.22" ;;
+        node7) d_ip="13.13.7.7" ;;
+        node20) d_ip="13.13.7.20" ;;
+        node21) d_ip="13.13.7.21" ;;
+        node22) d_ip="13.13.7.22" ;;
         node26) d_ip="10.16.1.26" ;;
+        node28) d_ip="10.16.1.28" ;;
         sglang2) d_ip="10.16.1.33" ;;
         node104) d_ip="12.12.12.104" ;;
         node107) d_ip="12.12.12.107" ;;
@@ -85,6 +91,18 @@ if ! port_free "$prom_port"; then
 fi
 
 echo "Starting PD router: prefill=${p_ip}:${prefill_port} (bootstrap ${bootstrap_port}), decode=${d_ip}:${decode_port}, router=:${router_port}, prometheus=:${prom_port}"
+
+# Publish the exact endpoints used by this router. The profiling benchmark reads
+# this shared state instead of maintaining a second, easily stale host mapping.
+router_state_file="${PD_ROUTER_STATE_FILE:-/home/scripts/SGlang_Docs/pd-script/.router_endpoints.env}"
+router_state_tmp="${router_state_file}.tmp.$$"
+{
+    printf 'ROUTER_PREFILL_URL=%q\n' "http://${p_ip}:${prefill_port}"
+    printf 'ROUTER_DECODE_URL=%q\n' "http://${d_ip}:${decode_port}"
+    printf 'ROUTER_PORT=%q\n' "$router_port"
+} > "$router_state_tmp"
+mv -f "$router_state_tmp" "$router_state_file"
+
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --prefill "http://${p_ip}:${prefill_port}" "${bootstrap_port}" \
