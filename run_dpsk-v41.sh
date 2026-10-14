@@ -6,9 +6,72 @@
 #   - PD_OPEN=1 adds the disaggregation transport on top of that topology;
 #     PD_OPEN=0 (default) runs the same topology standalone on one node
 #   - HCU_NUM>8 switches to a multi-node launch (NNODES / NODE_RANK)
+#
+# 需要新增 / 修改「指令」或「环境变量」时，只改下面 OPT-BEGIN 那个登记处。
 # source /home/unset_proxy.sh  # uncomment if a proxy breaks the PD bootstrap server
 
 set -o pipefail
+
+# ===========================================================================
+#  动态优化点登记处
+#
+#  以后要新增 / 修改「指令」或「环境变量」，只改这一段，下面任何代码都不用动。
+#  区块内每一行都是注释，写错也不影响脚本运行。
+#
+#  格式：
+#      #env NAME=VALUE        追加一个环境变量
+#      #arg --flag value      追加一段启动指令
+#      把行首的 # 改成 ## 即可临时停用该行（保留记录，不生效）
+#
+#  规则：
+#      - 按日期分组，用  # ---- YYYYMMDD ----  这样的注释行隔开，便于看清
+#        每个优化点是哪天加进去的
+#      - 这里只写字面值，不支持 $变量、不支持条件判断。需要按 PD_MODE /
+#        PD_OPEN / MOE_MODE 等条件才生效的开关，请写进下面的 bash 逻辑里
+#        （见 env_vars 构建处）
+#      - 不要删掉 BEGIN / END 两行标记，脚本靠它们定位这一段
+# ===========================================================================
+# >>> OPT-BEGIN
+#
+# ---- Common Optimizations ----
+#env SGLANG_TORCH_PROFILER_DIR=/home/proj_dpsk-v4/profile
+#env SGLANG_OPT_SWIGLU_CLAMP_FUSION=false
+#env SGLANG_USE_AITER_AG=0
+#env SGLANG_USE_LIGHTOP=1
+#env SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT=1
+#env SGLANG_USE_DEEPGEMM_MOE=1
+#env SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE=1
+#env SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM=1
+#env SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA=1
+#env SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=1
+#env SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
+#env SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4=1
+#
+# ---- 20261009 Optimizations ----
+##DEEPEP_ENABLE_LL_LAYERED_OPT=1, ROCSHMEM_DISABLE_HDP_FLUSH=1, --enable-dp-attention-local-control-broadcast only in decode
+##arg --enable-cp-cache-layer-split, work only in prefill or ifb but no spec
+#env SGLANG_USE_LIGHTOP_DSV41_PAGED_INDEXER=1
+#
+# ---- 20261010 Optimizations ----
+#env ROCBLAS_TENSILE_LIBPATH=/home/proj_dpsk-v4/configs/dpsk-v41-dp8ep8-lib
+# 
+# ---- 20261013 Optimizations ----
+##arg --enable-single-batch-overlap
+#
+##arg --cuda-graph-backend-decode disabled
+##arg --enable-cp-decode-attn-tp
+#
+# <<< OPT-END
+#
+#  ---- 以下是解析逻辑，不需要修改 ----
+OPT_ENV=()
+OPT_ARGS=()
+while IFS= read -r _opt_line; do
+    case "$_opt_line" in
+        "#env "*) OPT_ENV+=("${_opt_line#\#env }") ;;
+        "#arg "*) OPT_ARGS+=("${_opt_line#\#arg }") ;;
+    esac
+done < <(sed -n '/^# >>> OPT-BEGIN$/,/^# <<< OPT-END$/p' "${BASH_SOURCE[0]}")
 
 export PYTHONPATH=/home/proj_dpsk-v4/sglang-das/python:${PYTHONPATH:-}
 
@@ -51,7 +114,18 @@ Core selectors:
                             0  Same topology, standalone: the P or D profile
                                runs on its own with no transfer arguments.
                             Requires PD_MODE=prefill or PD_MODE=decode.
-  MOE_MODE=none|triton|deepep|megamoe
+  SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe|deep_gemm
+                            HCU Mega implementation (default: megamoe).
+                            deep_gemm requires deepgemm.mega with V4.1 DSpark TopK3.
+  MEGAMOE_HCU_BACKEND=normal|auto|ll
+                            Standalone defaults to normal; LL is opt-in.
+  DG_MEGA_HT_EXPECTED       deep_gemm defaults to 0 (validated HT path).
+  DSPARK_MOE_MODE=none|deepep|megamoe
+                            D-side draft backend (default: target MOE_MODE);
+                            P-side draft remains standalone triton.
+  CHUNK_SIZE=N              Prefill chunk (default: 32768; Mega P: 16384).
+                            Mega cap: P full chunk, D ceil(chunk/HCU_NUM).
+  MOE_MODE=none|triton|deepep|megamoe|aiter|humming
                             MoE runtime for the P/D paths (default: deepep when
                             PD_MODE is set, none otherwise). P/D paths require
                             deepep or megamoe.
@@ -59,7 +133,7 @@ Core selectors:
                             PC_ENABLE=1 enables the DSV4 decode radix path.
   DSPARK_BLOCK_SIZE=N       DSpark block size (default: 5).
   DSPARK_DRAFT_MODEL_PATH=P Draft checkpoint (default: MODEL_PATH).
-  MEM_FRACTION_STATIC=F     KV cache memory fraction (default: 0.8).
+  MEM_FRACTION_STATIC=F     KV cache memory fraction (default: 0.85; Mega P: 0.80).
   MAX_PREFILL_TOKENS=N      Optional prefill token cap on the P side.
   MAX_RUNNING_REQUESTS=N    Scheduler concurrency cap (default: 32).
   IB_DEVICES=LIST           PD/distributed RDMA devices (default: mlx5_2 on
@@ -71,6 +145,13 @@ Core selectors:
   PD_DECODE_DIST_PORT=N     PD D-side init port (default: 6244).
   DECODE_DIST_INIT_PORT=N   Standalone decode init port (default: PORT + 733).
   DRY_RUN=1                 Print the resolved command without starting.
+
+Adding an optimization point:
+  Put its environment variables / CLI flags in the OPT-BEGIN block at the top
+  of this file, grouped under a  # ---- YYYYMMDD ----  comment. They are then
+  appended to the exported environment and to the `sglang serve` line. Nothing
+  else in the script needs to change. Switches that must apply only for some
+  topologies stay in the bash logic below (env_vars construction).
 
 Distributed init-address precedence (exactly one --dist-init-addr is emitted):
   PD P side (PD_OPEN=1)            HOST:PD_PREFILL_DIST_PORT
@@ -124,6 +205,10 @@ resolve_ip() {
     fi
 
     case "$host_arg" in
+        S1) echo 10.243.1.1 ;;
+        S4) echo 10.243.1.4 ;;
+        S5) echo 10.243.1.5 ;;
+        S9) echo 10.243.1.9 ;;
         node18) echo 13.13.2.18 ;;
         node20) echo 13.13.2.20 ;;
         node22) echo 13.13.2.22 ;;
@@ -133,14 +218,15 @@ resolve_ip() {
         node107) echo 12.12.12.107 ;;
         node110) echo 12.12.12.110 ;;
         sglang2) echo 10.16.1.33 ;;
-        *) die "Invalid HOST=$host_arg (expected: node18|node20|node22|node26|node104|node107|node110|sglang2)" ;;
+        *) die "Invalid HOST=$host_arg (expected: node18|node20|node22|node26|node104|node105|node107|node110|sglang2)" ;;
     esac
 }
 
 resolve_network_interface() {
     case "$1" in
-        nmz26|nmz20|nmz22|nmz18|nmz15|nmz21|nmz7|nmz28) echo ens66f1np1 ;;
+        nmz26|nmz20|nmz22|nmz21|nmz18|nmz15|nmz21|nmz7|nmz28) echo ens66f1np1 ;;
         nmz105|nmz107|nmz104|nmz110) echo ens65f0np0 ;;
+        S1|S4|S5|S9) echo ens30np0 ;;        
         sglang5) echo eth0 ;;
         sglang8) echo enp113s0f0np0 ;;
         sglang6) echo eth10 ;;
@@ -196,6 +282,22 @@ append_distributed_init_args() {
     [[ -z "$dist_init_addr" ]] || DEFAULT_ARGS+=(--dist-init-addr "$dist_init_addr")
 }
 
+append_draft_moe_args() {
+    local mode=none
+    [[ "$1" != decode ]] || mode=$dspark_moe_mode
+    case "$mode" in
+        none)
+            DEFAULT_ARGS+=(--speculative-moe-a2a-backend none --speculative-moe-runner-backend triton)
+            ;;
+        deepep)
+            DEFAULT_ARGS+=(--speculative-moe-a2a-backend deepep --speculative-moe-runner-backend deep_gemm)
+            ;;
+        megamoe)
+            DEFAULT_ARGS+=(--speculative-moe-a2a-backend megamoe)
+            ;;
+    esac
+}
+
 # P side: CP + EP prefill. The DSpark draft only injects target hidden/KV
 # states and must not initialize the decode-side DP/LM-head path, so the
 # draft runs through the standalone triton path while the CP/EP target uses
@@ -206,29 +308,24 @@ append_prefill_args() {
         --cp-strategy interleave
         --dp 1
         --attn-cp-size "$tp_size"
+        # --enable-cp-cache-layer-split
     )
     case "$moe_mode" in
         none|triton)
             DEFAULT_ARGS+=(
                 --moe-runner-backend triton
-                --speculative-moe-a2a-backend none
-                --speculative-moe-runner-backend triton
             )
             ;;
         aiter)
             DEFAULT_ARGS+=(
                 --moe-runner-backend aiter
-                --speculative-moe-a2a-backend none
-                --speculative-moe-runner-backend triton
             )
-            ;;            
+            ;;
         deepep)
             append_deepep_args
             DEFAULT_ARGS+=(
-                --deepep-mode normal 
+                --deepep-mode auto
                 --moe-runner-backend deep_gemm
-                --speculative-moe-a2a-backend deepep
-                --speculative-moe-runner-backend triton
             )
             ;;
         megamoe)
@@ -243,6 +340,7 @@ append_prefill_args() {
             ;;
     esac
     [[ -z "${MAX_PREFILL_TOKENS:-}" ]] || DEFAULT_ARGS+=(--max-prefill-tokens "$MAX_PREFILL_TOKENS")
+    append_draft_moe_args prefill
     [[ "$pd_open" != 1 ]] || append_pd_args prefill
 }
 
@@ -251,6 +349,7 @@ append_decode_args() {
     DEFAULT_ARGS+=(
         --dp "$dp_size"
         --enable-dp-attention
+        # --enable-dp-attention-local-control-broadcast
         --enable-dp-lm-head
         --ep "$tp_size"
     )
@@ -258,36 +357,35 @@ append_decode_args() {
         none|triton)
             DEFAULT_ARGS+=(
                 --moe-runner-backend triton
-                --speculative-moe-a2a-backend none
-                --speculative-moe-runner-backend triton
             )
             ;;
         aiter)
             DEFAULT_ARGS+=(
                 --moe-runner-backend aiter
-                --speculative-moe-a2a-backend none
-                --speculative-moe-runner-backend triton
             )
-            ;;            
+            ;;
         deepep)
             append_deepep_args
             DEFAULT_ARGS+=(
                 --deepep-mode auto
                 --moe-runner-backend deep_gemm
-                --speculative-moe-a2a-backend none
-                --speculative-moe-runner-backend triton
             )
             ;;
         megamoe)
             DEFAULT_ARGS+=(--moe-a2a-backend megamoe)
             ;;
         humming)
+            # NOTE: was `--deepep-dispatcher-output-fp8` here, which is not a
+            # real flag (the prefill branch and sglang's own error message both
+            # use `--deepep-dispatcher-output-dtype`). Kept as -dtype fp8, which
+            # matches the prefill branch's intent.
             DEFAULT_ARGS+=(
                 --moe-runner-backend humming
                 --deepep-dispatcher-output-dtype fp8
                 )
-            ;;            
+            ;;
     esac
+    append_draft_moe_args decode
     [[ "$pd_open" != 1 ]] || append_pd_args decode
 }
 
@@ -316,6 +414,7 @@ print_launch_profile() {
     echo "---- Launch Profile ------"
     echo "host=$the_host ip=$ip port=$port model=$model_path"
     echo "HCU_NUM=$tp_size PD_MODE=$pd_mode PD_OPEN=$pd_open MOE_MODE=$moe_mode PC_ENABLE=$pc_enable"
+    echo "SGLANG_HCU_MEGA_MOE_RUNTIME=$hcu_mega_moe_runtime DSPARK_MOE_MODE=$dspark_moe_mode CHUNK_SIZE=$chunk_size"
     echo "DSPARK_BLOCK_SIZE=$dspark_block_size MEM_FRACTION_STATIC=$mem_fraction_static MAX_RUNNING_REQUESTS=$max_running_requests"
     echo "NNODES=$nnodes NODE_RANK=$node_rank DIST_INIT_ADDR=${dist_init_addr:-auto}"
 }
@@ -344,13 +443,30 @@ node_rank=${NODE_RANK:-$rank_id}
 pd_mode=${PD_MODE:-none}
 pd_open=${PD_OPEN:-0}
 moe_mode=${MOE_MODE:-none}
+hcu_mega_moe_runtime=${SGLANG_HCU_MEGA_MOE_RUNTIME:-megamoe}
+chunk_size_default=32768
+# if [[ "$pd_mode" == prefill && "$moe_mode" == megamoe ]]; then
+#     # Reserve space for the NORMAL scratch buffers of the V4.1 shape.
+#     chunk_size_default=16384
+# fi
+chunk_size=${CHUNK_SIZE:-$chunk_size_default}
 if [[ "$pd_mode" != none && -z "${MOE_MODE+x}" ]]; then
     moe_mode=deepep
+fi
+dspark_moe_mode=none
+if [[ "$pd_mode" == decode ]]; then
+    dspark_moe_mode=${DSPARK_MOE_MODE:-$moe_mode}
 fi
 pc_enable=${PC_ENABLE:-0}
 dspark_block_size=${DSPARK_BLOCK_SIZE:-5}
 dspark_draft_model_path=${DSPARK_DRAFT_MODEL_PATH:-$model_path}
-mem_fraction_static=${MEM_FRACTION_STATIC:-0.8}
+mem_fraction_default=0.85
+# V4.1 counts draft weights in the KV budget; 0.75 is below the loaded
+# checkpoint minimum (~0.761). Reserve a viable cache for every MoE backend.
+if [[ "$pd_mode" == prefill && "$moe_mode" == megamoe ]]; then
+    mem_fraction_default=0.80
+fi
+mem_fraction_static=${MEM_FRACTION_STATIC:-$mem_fraction_default}
 max_running_requests=${MAX_RUNNING_REQUESTS:-32}
 pd_bootstrap_port=${SGLANG_DISAGGREGATION_BOOTSTRAP_PORT:-8998}
 pd_prefill_dist_port=${PD_PREFILL_DIST_PORT:-6144}
@@ -363,6 +479,8 @@ local_decode_dist_port=${DECODE_DIST_INIT_PORT:-$((port + 733))}
 [[ "$max_running_requests" =~ ^[0-9]+$ ]] && (( max_running_requests > 0 )) || die "MAX_RUNNING_REQUESTS must be a positive integer (got: $max_running_requests)"
 case "$pd_mode" in none|prefill|decode) ;; *) die "Invalid PD_MODE=$pd_mode (expected: none|prefill|decode)" ;; esac
 case "$moe_mode" in none|triton|aiter|deepep|megamoe|humming) ;; *) die "Invalid MOE_MODE=$moe_mode (expected: none|triton|aiter|deepep|megamoe|humming)" ;; esac
+case "$dspark_moe_mode" in none|triton|aiter|humming) dspark_moe_mode=none ;; deepep|megamoe) ;; *) die "Invalid DSPARK_MOE_MODE=$dspark_moe_mode (expected: none|deepep|megamoe)" ;; esac
+[[ "$chunk_size" =~ ^[0-9]+$ ]] && (( chunk_size > 0 )) || die "CHUNK_SIZE must be positive"
 case "$pc_enable" in 0|1) ;; *) die "PC_ENABLE must be 0 or 1" ;; esac
 case "$pd_open" in 0|1) ;; *) die "PD_OPEN must be 0 or 1" ;; esac
 if [[ "$pd_open" == 1 && "$pd_mode" == none ]]; then
@@ -382,22 +500,14 @@ dist_init_addr=$(resolve_dist_init_addr) || exit $?
 env_vars=(
     "NCCL_SOCKET_IFNAME=$net_ifname"
     "GLOO_SOCKET_IFNAME=$net_ifname"
-    # HCU compatibility switches needed by the current DeepSeek V4 path.
-    "SGLANG_TORCH_PROFILER_DIR=/home/proj_dpsk-v4/profile"
-    "SGLANG_OPT_SWIGLU_CLAMP_FUSION=false"
-    "SGLANG_USE_AITER_AG=0"
-    "SGLANG_USE_LIGHTOP=1"
-    "SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT=1"
-    "SGLANG_USE_DEEPGEMM_MOE=1"
-    "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE=1"
-    "SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM=1"
-    "SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA=1"
-    "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=1"
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
-    # opt args
-    "SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4=1" # default as 1, need to confirm
 )
 
+# 动态优化点登记处里的环境变量（见文件顶部 OPT-BEGIN 区块）
+for _opt_env in "${OPT_ENV[@]}"; do
+    env_vars+=("$_opt_env")
+done
+
+# 下面这些开关跟着拓扑走，不属于「随时间新增的优化点」，所以留在代码里。
 # Cross-node NCCL fabric selection. Required by ANY multi-node run, not just
 # PD: this host exposes mlx5_0..mlx5_9, and with no explicit list RCCL can
 # select mlx5_0/mlx5_1, which are not on the inter-node fabric. The prefill/
@@ -439,10 +549,8 @@ case "${moe_mode:-}" in
         env_vars+=("SGLANG_USE_FP8_W8A8_MOE=1")
         ;;
     megamoe)
-        env_vars+=(
-            "SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
-            "SGLANG_DSV4_CHANNEL_FP8_SCALE=1"
-        )
+        # Runtime-specific configuration is shared by target and draft below.
+        :
         ;;
     humming)
         env_vars+=(
@@ -451,9 +559,35 @@ case "${moe_mode:-}" in
         ;;
 esac
 
+if [[ "$moe_mode" == megamoe || "$dspark_moe_mode" == megamoe ]]; then
+    case "$hcu_mega_moe_runtime" in
+        megamoe|deep_gemm) ;;
+        *) die "Invalid SGLANG_HCU_MEGA_MOE_RUNTIME=$hcu_mega_moe_runtime" ;;
+    esac
+    # CP admission is per batch: reserve the unsharded chunk on the P side.
+    mega_capacity_default=$(((chunk_size + tp_size - 1) / tp_size))
+    [[ "$pd_mode" != prefill ]] || mega_capacity_default=$chunk_size
+    mega_capacity=${SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK:-$mega_capacity_default}
+    [[ "$mega_capacity" =~ ^[0-9]+$ ]] && (( mega_capacity > 0 )) || die "Mega token capacity must be positive"
+    env_vars+=(
+        "SGLANG_HCU_MEGA_MOE_RUNTIME=$hcu_mega_moe_runtime"
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=$mega_capacity"
+    )
+    if [[ "$hcu_mega_moe_runtime" == megamoe ]]; then
+        env_vars+=(
+            "SGLANG_DSV4_CHANNEL_FP8_SCALE=1"
+            "MEGAMOE_HCU_BACKEND=${MEGAMOE_HCU_BACKEND:-normal}"
+        )
+    else
+        # Native channel-scale tensors come from the serialized checkpoint.
+        env_vars+=("DG_MEGA_HT_EXPECTED=${DG_MEGA_HT_EXPECTED:-0}")
+    fi
+fi
+
 if [[ "$pd_mode" == decode ]]; then
     env_vars+=(
-        "ROCBLAS_TENSILE_LIBPATH=/home/proj_dpsk-v4/configs/dpsk-v41-dp8ep8-lib"
+        "DEEPEP_ENABLE_LL_LAYERED_OPT=1"
+        "ROCSHMEM_DISABLE_HDP_FLUSH=1"
     )
 fi
 
@@ -474,7 +608,6 @@ DEFAULT_ARGS=(
     --dist-timeout 10000
     --watchdog-timeout 3600
     --cuda-graph-backend-prefill disabled
-    # --cuda-graph-backend-decode disabled
     --skip-server-warmup
     --mem-fraction-static "$mem_fraction_static"
     --max-running-requests "$max_running_requests"
@@ -483,16 +616,14 @@ DEFAULT_ARGS=(
     --speculative-dspark-block-size "$dspark_block_size"
     --reasoning-parser auto
     --tool-call-parser auto
-    # opt args
-    # --enable-dsa-cache-layer-split # enable it only prefill CP + DSA 模型 + PD 的 P 端 + KV 显存确实是瓶颈
-    # --enable-cp-decode-attn-tp # work only on IFB mode
+    --chunked-prefill-size "$chunk_size"
 )
 append_distributed_init_args
 
 # The original standalone profile runs the MoE through the triton runner;
 # the P/D paths select explicit target and draft MoE backends per MOE_MODE.
 if [[ "$pd_mode" == none ]]; then
-    DEFAULT_ARGS+=(--moe-runner-backend $moe_mode)
+    DEFAULT_ARGS+=(--moe-runner-backend triton)
     [[ "$moe_mode" != aiter ]] || DEFAULT_ARGS+=(--speculative-moe-runner-backend triton)
 fi
 
@@ -504,6 +635,16 @@ esac
 [[ "$pc_enable" != 0 ]] || DEFAULT_ARGS+=(--disable-radix-cache)
 if [[ "$pc_enable" == 1 && "$pd_open" == 1 && "$pd_mode" == decode ]]; then
     DEFAULT_ARGS+=(--disaggregation-decode-enable-radix-cache)
+fi
+
+# 动态优化点登记处里的指令（见文件顶部 OPT-BEGIN 区块）
+if (( ${#OPT_ARGS[@]} > 0 )); then
+    declare -a _opt_words=()
+    for _opt_arg in "${OPT_ARGS[@]}"; do
+        _opt_words=()
+        read -r -a _opt_words <<< "$_opt_arg"
+        DEFAULT_ARGS+=("${_opt_words[@]}")
+    done
 fi
 
 FINAL_ARGS=("${DEFAULT_ARGS[@]}")

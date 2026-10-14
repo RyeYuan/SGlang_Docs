@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-export PYTHONPATH=/home/proj_sglang_fork/sglang-das/python:${PYTHONPATH:-}
+# export PYTHONPATH=/home/proj_sglang_fork/sglang-das/python:${PYTHONPATH:-}
 
 readonly DEEPEP_CONFIG=/home/proj_dpsk-v4/configs/deepep_IntraConfig.json
 readonly IB_DEVICES=${IB_DEVICES:-mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9}
@@ -38,6 +38,18 @@ Core selectors:
   PC_ENABLE=0|1             Enable radix cache. In PD decode mode this also
                             enables the experimental DSV4 decode radix path.
   MOE_MODE=deepep|megamoe   Target MoE runtime selection (default: deepep).
+  SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe|deep_gemm
+                            HCU MegaMoE implementation (default: megamoe).
+                            deep_gemm requires the deepgemm.mega package.
+  MEGAMOE_HCU_BACKEND=normal|auto|ll
+                            Standalone defaults to normal; LL is opt-in.
+  DG_MEGA_HT_EXPECTED       deep_gemm defaults to 0 (force HT); the current
+                            operator's LL path fails real-checkpoint validation.
+  SGLANG_ENABLE_CP_V2=0|1  Standard single-node prefill defaults to CP-v2 (1).
+                            Prefill disables decode CUDA graphs; BCG_ENABLE
+                            still controls the separate prefill graph backend.
+  DEEPEP_MODE=normal|auto|low_latency
+                            Prefill defaults to normal; other modes to auto.
   MTP_MODE=none|mtp|dspark  Speculative mode (default: none).
   IS_INT8=0|1               Enable SlimQuant INT8 loading.
   IS_FP8=0|1                Enable FP8 HCU optimization flags (default: 1).
@@ -135,6 +147,10 @@ Examples:
   PD_MODE=prefill PP_SIZE=1 MOE_MODE=megamoe \
     bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
+  # Single-node CP + DeepGEMM MegaMoE prefill
+  SGLANG_HCU_MEGA_MOE_RUNTIME=deep_gemm PD_MODE=prefill PP_SIZE=1 MOE_MODE=megamoe \
+    bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
+
   # DP + EP + MTP decode
   PD_MODE=decode MTP_MODE=mtp bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
 
@@ -206,22 +222,29 @@ resolve_ip() {
     fi
 
     case "$host_arg" in
+        S1) echo 10.243.1.1 ;;
+        S4) echo 10.243.1.4 ;;
+        S5) echo 10.243.1.5 ;;
+        S9) echo 10.243.1.9 ;;
         node18) echo 13.13.2.18 ;;
         node20) echo 13.13.2.20 ;;
         node22) echo 13.13.2.22 ;;
         node26) echo 13.13.2.26 ;;
         node104) echo 12.12.12.104 ;;
+        node105) echo 12.12.12.105 ;;
         node107) echo 12.12.12.107 ;;
         node110) echo 12.12.12.110 ;;
         sglang2) echo 10.16.1.33 ;;
-        *) die "Invalid HOST=$host_arg (expected: node18|node20|node22|node26|sglang2)" ;;
+        nmz28) echo 13.13.2.28 ;;
+        *) die "Invalid HOST=$host_arg (expected: node18|node20|node22|node26|sglang2|nmz28)" ;;
     esac
 }
 
 resolve_network_interface() {
     case "$1" in
-        nmz26|nmz20|nmz22|nmz18|nmz15) echo ens66f1np1 ;;
-        nmz107|nmz104|nmz110) echo ens65f0np0;;
+        nmz26|nmz20|nmz22|nmz18|nmz15|nmz28) echo ens66f1np1 ;;
+        nmz107|nmz104|nmz105|nmz110) echo ens65f0np0;;
+        S1|S4|S5|S9) echo ens30np0 ;;        
         sglang5) echo eth0 ;;
         sglang8) echo enp113s0f0np0 ;;
         sglang6) echo eth10 ;;
@@ -440,6 +463,9 @@ append_mtp_args() {
 }
 
 append_prefill_parallel_args() {
+    # if [[ "$mtp_mode" == none ]]; then
+    #     DEFAULT_ARGS+=(--cuda-graph-backend-decode disabled)
+    # fi
     if [[ "$moe_mode" == megamoe ]]; then
         DEFAULT_ARGS+=(
             --enable-prefill-cp
@@ -552,6 +578,7 @@ deepep_mode=${DEEPEP_MODE:-auto}
 pd_mode=${PD_MODE:-none}
 pd_open=${PD_OPEN:-0}
 moe_mode=${MOE_MODE:-deepep}
+hcu_mega_moe_runtime=${SGLANG_HCU_MEGA_MOE_RUNTIME:-megamoe}
 mtp_mode=${MTP_MODE:-none}
 dspark_moe_mode=${DSPARK_MOE_MODE:-none}
 dspark_variant=${DSPARK_VARIANT:-static}
@@ -597,6 +624,7 @@ fi
 
 case "$pd_mode" in none|prefill|decode) ;; *) die "Invalid PD_MODE=$pd_mode (expected: none|prefill|decode)" ;; esac
 case "$mtp_mode" in none|dspark|mtp) ;; *) die "Invalid MTP_MODE=$mtp_mode (expected: none|dspark|mtp)" ;; esac
+case "$moe_mode" in deepep|megamoe) ;; *) die "Invalid MOE_MODE=$moe_mode (expected: deepep|megamoe)" ;; esac
 case "$weight_load_multithread" in 0|1) ;; *) die "WEIGHT_LOAD_MULTITHREAD must be 0 or 1" ;; esac
 case "$weight_loader_prefetch" in 0|1) ;; *) die "WEIGHT_LOADER_PREFETCH must be 0 or 1" ;; esac
 [[ "$weight_load_threads" =~ ^[0-9]+$ ]] && (( weight_load_threads > 0 )) || die "WEIGHT_LOAD_THREADS must be a positive integer"
@@ -633,12 +661,12 @@ rocshmem_env_vars=(
 # network error". Verified on nmz20+nmz22: a 16-rank [32,7168] all-reduce
 # fails without this list and passes with it, everything else held equal.
 nccl_fabric_env_vars=(
-    "NCCL_IB_HCA=mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1"
+    "NCCL_IB_HCA=$IB_DEVICES"
 )
 
 pd_env_vars=(
     "MC_ENABLE_DEST_DEVICE_AFFINITY=1"
-    "UCX_NET_DEVICES=mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1"
+    "UCX_NET_DEVICES=$IB_DEVICES"
     "MC_ALLOWED_IBV_DEVICES=$IB_DEVICES"
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200"
     "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1"
@@ -698,6 +726,14 @@ if [[ "$pd_mode" != none ]]; then
         "SGLANG_USE_DEEPGEMM_MOE=1"
     )
 fi
+if [[ "$pd_mode" == prefill && "$pp_size" == 1 && "$mtp_mode" == none ]]; then
+    env_vars+=(
+        "SGLANG_ENABLE_CP_V2=${SGLANG_ENABLE_CP_V2:-1}"
+        # HCU FP8 cache writes use LightOp; the generic fused store has known
+        # accuracy problems (see the platform flags above).
+        "SGLANG_OPT_USE_FUSED_STORE_CACHE=${SGLANG_OPT_USE_FUSED_STORE_CACHE:-0}"
+    )
+fi
 if [[ "$mtp_mode" != none ]]; then
     # DSpark FP8-channel checkpoints have BF16 wo_a; FP8 GEMM is invalid here.
     env_vars+=("SGLANG_OPT_FP8_WO_A_GEMM=0")
@@ -740,11 +776,33 @@ if [[ "$pc_enable" != 0 && "$pd_open" == 1 && "$pd_mode" == decode ]]; then
     )
 fi
 if [[ "$moe_mode" == megamoe || "$dspark_moe_mode" == megamoe || "$dspark_pd_draft_moe_mode" == megamoe ]]; then
+    case "$hcu_mega_moe_runtime" in
+        megamoe|deep_gemm) ;;
+        *) die "Invalid SGLANG_HCU_MEGA_MOE_RUNTIME=$hcu_mega_moe_runtime (expected: megamoe|deep_gemm)" ;;
+    esac
+    # A prefill batch can decline CP sharding (e.g. an uneven short batch).
+    # In that case each rank may receive the entire chunk.
+    mega_capacity_default=$((chunk_size / tp_size))
+    [[ "$pd_mode" != prefill ]] || mega_capacity_default=$chunk_size
+    mega_capacity=${SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK:-$mega_capacity_default}
+    [[ "$mega_capacity" =~ ^[0-9]+$ ]] && (( mega_capacity > 0 )) || die "Mega token capacity must be positive"
     env_vars+=(
-        "SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=$((chunk_size / tp_size))"
-        "SGLANG_DSV4_CHANNEL_FP8_SCALE=1"
+        "SGLANG_HCU_MEGA_MOE_RUNTIME=$hcu_mega_moe_runtime"
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=$mega_capacity"
     )
+    # deepgemm.mega consumes channel scales from the checkpoint directly.
+    # Retain the legacy channel-scale flag only for the standalone runtime.
+    if [[ "$hcu_mega_moe_runtime" == megamoe ]]; then
+        # NORMAL is the validated DSpark graph path; explicit overrides win.
+        env_vars+=("MEGAMOE_HCU_BACKEND=${MEGAMOE_HCU_BACKEND:-normal}")
+    fi
+    if [[ "$hcu_mega_moe_runtime" == megamoe ]]; then
+        env_vars+=("SGLANG_DSV4_CHANNEL_FP8_SCALE=1")
+    else
+        # LL fails with DSV4 channel-FP8 checkpoint weights; HT passes both
+        # uniform and skewed/empty-rank NORMAL-reference checks on f6639d7.
+        env_vars+=("DG_MEGA_HT_EXPECTED=${DG_MEGA_HT_EXPECTED:-0}")
+    fi
 fi
 [[ "$is_int4" != 1 ]] || env_vars+=("SGLANG_W4A8_TPMOE_BACKEND=triton")
 
@@ -777,7 +835,7 @@ DEFAULT_ARGS=(
     --chunked-prefill-size $chunk_size
     --disable-flashinfer-autotune
     --skip-server-warmup
-    --cuda-graph-max-bs "$cuda_graph_max_bs"
+    # --cuda-graph-max-bs "$cuda_graph_max_bs"
     --kv-cache-dtype auto
     --mem-fraction-static "$mem_fraction_static"
     --swa-full-tokens-ratio 0.55
