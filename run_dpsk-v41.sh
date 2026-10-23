@@ -56,10 +56,26 @@ set -o pipefail
 #env ROCBLAS_TENSILE_LIBPATH=/home/proj_dpsk-v4/configs/dpsk-v41-dp8ep8-lib
 # 
 # ---- 20261013 Optimizations ----
-##arg --enable-single-batch-overlap
+##arg --enable-single-batch-overlap work only in prefill or ifb but no spec
+#
+# ---- 20261014 Optimizations ----
+##--enable-cp-cache-layer-split in dspark, works only in prefill or ifb but no spec
+#
+# ---- 20261019 Optimizations ----
+##env SGLANG_HCU_OPT_DSV41_PAIR_PARTNERS. default as 1
+#env NCCL_SIMPLE_CHANNELS=32
+##arg --enable-dp-attention-local-control-broadcast, work only in decode
+##arg --enable-decoder-swa-bounded-replay, work only in prefill or ifb
+#
+# ---- 20261020 Optimizations ----
+##env SGLANG_HCU_PREFILL_PAGED_SPARSE=1, work only in prefill or ifb, to control the mqa logits, default as 1
+##env SGLANG_HCU_PREFILL_SPARSE_FUSION=1, work only in prefill or ifb, to control the mqa logits fusion, default as 1
+##arg --enable-single-batch-overlap, both prefill and decode support SBO but has to be disabled in megamoe mode.
+#
 #
 ##arg --cuda-graph-backend-decode disabled
 ##arg --enable-cp-decode-attn-tp
+##env SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED=1, need to lightop support special page_size
 #
 # <<< OPT-END
 #
@@ -73,14 +89,46 @@ while IFS= read -r _opt_line; do
     esac
 done < <(sed -n '/^# >>> OPT-BEGIN$/,/^# <<< OPT-END$/p' "${BASH_SOURCE[0]}")
 
-export PYTHONPATH=/home/proj_dpsk-v4/sglang-das/python:${PYTHONPATH:-}
+# export PYTHONPATH=/home/proj_dpsk-v4/sglang-das/python:${PYTHONPATH:-}
 
 readonly DEEPEP_CONFIG=/home/proj_dpsk-v4/configs/deepep_IntraConfig.json
-default_ib_devices=mlx5_0
-case "$(hostname -s)" in
-    nmz20|nmz22) default_ib_devices=mlx5_2 ;;
+# Pick the RDMA NIC by fabric, not by its mlx5_N name (RoCE v2 GID index 3):
+#   IB_RAIL=1..8  13.13.<rail>.x  nmz7/15/18/20/21/22/26/28 only (8 rails each)
+#   IB_RAIL=12    12.12.12.x      every host; the only NIC of nmz104/105/107/110
+# The mlx5_N numbering differs per host (rail 2 is mlx5_3 on most, mlx5_1 on
+# nmz7), and the fabrics are separate subnets: P and D on different ones fail
+# the mooncake handshake with "Failed to modify QP to RTR ... Connection timed
+# out". Default rail 2, or 12 when this host or the PD peer (PD_PEER) has no
+# 13.13 fabric. IB_DEVICES overrides all of this.
+ib_device_on_rail() {
+    local dev gid prefix
+    if [[ "$1" == 12 ]]; then
+        prefix=0000:0000:0000:0000:0000:ffff:0c0c:0c
+    else
+        prefix=0000:0000:0000:0000:0000:ffff:0d0d:$(printf %02x "$1")
+    fi
+    for dev in /sys/class/infiniband/*; do
+        gid=$(cat "$dev/ports/1/gids/3" 2>/dev/null) || continue
+        if [[ "$gid" == "$prefix"?? && "$(cat "$dev/ports/1/state" 2>/dev/null)" == *ACTIVE ]]; then
+            basename "$dev"
+            return
+        fi
+    done
+}
+default_ib_rail=2
+case "${PD_PEER:-}" in
+    *104|*105|*107|*110) default_ib_rail=12 ;;  # nmz104 / node104 / 12.12.12.104 ...
 esac
-readonly IB_DEVICES=${IB_DEVICES:-$default_ib_devices}
+[[ -n "$(ib_device_on_rail 2)" ]] || default_ib_rail=12
+readonly IB_RAIL=${IB_RAIL:-$default_ib_rail}
+default_ib_devices=$(ib_device_on_rail "$IB_RAIL")
+if [[ -z "${IB_DEVICES:-}" && -z "$default_ib_devices" && -n "$(ib_device_on_rail 12)" ]]; then
+    # On the zz fabric but the requested rail has no active NIC here.
+    echo "ERROR: no active RDMA NIC on IB_RAIL=$IB_RAIL on $(hostname -s)" >&2
+    exit 1
+fi
+# Hosts outside these fabrics (sz S*, sglang*) keep the old name-based default.
+readonly IB_DEVICES=${IB_DEVICES:-${default_ib_devices:-mlx5_3}}
 readonly DEFAULT_MODEL_PATH=/module/DeepSeek-V4.1-Flash-Channel-FP8
 
 die() {
@@ -136,8 +184,12 @@ Core selectors:
   MEM_FRACTION_STATIC=F     KV cache memory fraction (default: 0.85; Mega P: 0.80).
   MAX_PREFILL_TOKENS=N      Optional prefill token cap on the P side.
   MAX_RUNNING_REQUESTS=N    Scheduler concurrency cap (default: 32).
-  IB_DEVICES=LIST           PD/distributed RDMA devices (default: mlx5_2 on
-                            nmz20/nmz22; mlx5_0 elsewhere).
+  IB_RAIL=N                 RDMA fabric: 1..8 = 13.13.N.x, 12 = 12.12.12.x
+                            (default 2; 12 on nmz104/105/107/110 or when
+                            PD_PEER is one of them). Both PD ends must match.
+  PD_PEER=HOST              The other PD end (nmz107, node107, ...); picks
+                            IB_RAIL=12 when it is only on 12.12.12.x.
+  IB_DEVICES=LIST           PD/distributed RDMA devices; overrides IB_RAIL
   NNODES=N                  Multi-node count (default: 2).
   NODE_RANK=N               Overrides positional RANK_ID.
   DIST_INIT_PORT=N          Generic multi-node init port (default: 6245).
@@ -208,6 +260,7 @@ resolve_ip() {
         S1) echo 10.243.1.1 ;;
         S4) echo 10.243.1.4 ;;
         S5) echo 10.243.1.5 ;;
+        S7) echo 10.243.1.5 ;;
         S9) echo 10.243.1.9 ;;
         node18) echo 13.13.2.18 ;;
         node20) echo 13.13.2.20 ;;
@@ -224,9 +277,10 @@ resolve_ip() {
 
 resolve_network_interface() {
     case "$1" in
-        nmz26|nmz20|nmz22|nmz21|nmz18|nmz15|nmz21|nmz7|nmz28) echo ens66f1np1 ;;
+        nmz26|nmz20|nmz22|nmz21|nmz18|nmz15|nmz28) echo ens66f1np1 ;;
+        nmz7) echo ens61f1np1 ;;  # rail 2 (13.13.2.7); its ens66f1np1 is rail 4
         nmz105|nmz107|nmz104|nmz110) echo ens65f0np0 ;;
-        S1|S4|S5|S9) echo ens30np0 ;;        
+        S1|S4|S5|S7|S9) echo ens30np0 ;;
         sglang5) echo eth0 ;;
         sglang8) echo enp113s0f0np0 ;;
         sglang6) echo eth10 ;;
@@ -283,8 +337,8 @@ append_distributed_init_args() {
 }
 
 append_draft_moe_args() {
-    local mode=none
-    [[ "$1" != decode ]] || mode=$dspark_moe_mode
+    local mode=$dspark_moe_mode
+    # [[ "$1" != decode ]] || mode=$dspark_moe_mode
     case "$mode" in
         none)
             DEFAULT_ARGS+=(--speculative-moe-a2a-backend none --speculative-moe-runner-backend triton)
@@ -308,17 +362,20 @@ append_prefill_args() {
         --cp-strategy interleave
         --dp 1
         --attn-cp-size "$tp_size"
-        # --enable-cp-cache-layer-split
+        --enable-cp-cache-layer-split
+        --enable-decoder-swa-bounded-replay
     )
     case "$moe_mode" in
         none|triton)
             DEFAULT_ARGS+=(
                 --moe-runner-backend triton
+                --enable-single-batch-overlap
             )
             ;;
         aiter)
             DEFAULT_ARGS+=(
                 --moe-runner-backend aiter
+                --enable-single-batch-overlap
             )
             ;;
         deepep)
@@ -326,6 +383,7 @@ append_prefill_args() {
             DEFAULT_ARGS+=(
                 --deepep-mode auto
                 --moe-runner-backend deep_gemm
+                --enable-single-batch-overlap
             )
             ;;
         megamoe)
@@ -349,7 +407,7 @@ append_decode_args() {
     DEFAULT_ARGS+=(
         --dp "$dp_size"
         --enable-dp-attention
-        # --enable-dp-attention-local-control-broadcast
+        --enable-dp-attention-local-control-broadcast
         --enable-dp-lm-head
         --ep "$tp_size"
     )
@@ -357,11 +415,13 @@ append_decode_args() {
         none|triton)
             DEFAULT_ARGS+=(
                 --moe-runner-backend triton
+                --enable-single-batch-overlap
             )
             ;;
         aiter)
             DEFAULT_ARGS+=(
                 --moe-runner-backend aiter
+                --enable-single-batch-overlap
             )
             ;;
         deepep)
@@ -369,6 +429,7 @@ append_decode_args() {
             DEFAULT_ARGS+=(
                 --deepep-mode auto
                 --moe-runner-backend deep_gemm
+                --enable-single-batch-overlap
             )
             ;;
         megamoe)
@@ -413,6 +474,7 @@ print_command() {
 print_launch_profile() {
     echo "---- Launch Profile ------"
     echo "host=$the_host ip=$ip port=$port model=$model_path"
+    echo "rdma=$IB_DEVICES (IB_RAIL=$IB_RAIL) socket_ifname=$net_ifname"
     echo "HCU_NUM=$tp_size PD_MODE=$pd_mode PD_OPEN=$pd_open MOE_MODE=$moe_mode PC_ENABLE=$pc_enable"
     echo "SGLANG_HCU_MEGA_MOE_RUNTIME=$hcu_mega_moe_runtime DSPARK_MOE_MODE=$dspark_moe_mode CHUNK_SIZE=$chunk_size"
     echo "DSPARK_BLOCK_SIZE=$dspark_block_size MEM_FRACTION_STATIC=$mem_fraction_static MAX_RUNNING_REQUESTS=$max_running_requests"
@@ -431,6 +493,12 @@ host_arg=${4:-}
 ip=$(resolve_ip "$host_arg") || exit $?
 the_host=$(hostname)
 net_ifname=$(resolve_network_interface "$the_host")
+# On the 12/13.13 fabrics the socket interface follows the RDMA NIC, so a
+# multi-node group on IB_RAIL=12 also talks TCP over 12.12.12.x.
+if [[ -n "$default_ib_devices" && "$IB_DEVICES" == "$default_ib_devices" ]]; then
+    ib_netdev=$(ls "/sys/class/infiniband/$IB_DEVICES/device/net" 2>/dev/null | head -1)
+    [[ -z "$ib_netdev" ]] || net_ifname=$ib_netdev
+fi
 
 if [[ "$the_host" == nmz26 ]]; then
     export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libibverbs:${LD_LIBRARY_PATH}
@@ -453,10 +521,10 @@ chunk_size=${CHUNK_SIZE:-$chunk_size_default}
 if [[ "$pd_mode" != none && -z "${MOE_MODE+x}" ]]; then
     moe_mode=deepep
 fi
-dspark_moe_mode=none
-if [[ "$pd_mode" == decode ]]; then
-    dspark_moe_mode=${DSPARK_MOE_MODE:-$moe_mode}
-fi
+dspark_moe_mode=${DSPARK_MOE_MODE:-$moe_mode}
+# if [[ "$pd_mode" == decode ]]; then
+#     dspark_moe_mode=${DSPARK_MOE_MODE:-$moe_mode}
+# fi
 pc_enable=${PC_ENABLE:-0}
 dspark_block_size=${DSPARK_BLOCK_SIZE:-5}
 dspark_draft_model_path=${DSPARK_DRAFT_MODEL_PATH:-$model_path}
@@ -566,8 +634,9 @@ if [[ "$moe_mode" == megamoe || "$dspark_moe_mode" == megamoe ]]; then
     esac
     # CP admission is per batch: reserve the unsharded chunk on the P side.
     mega_capacity_default=$(((chunk_size + tp_size - 1) / tp_size))
-    [[ "$pd_mode" != prefill ]] || mega_capacity_default=$chunk_size
     mega_capacity=${SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK:-$mega_capacity_default}
+    [[ "$pd_mode" != prefill ]] || mega_capacity=$mega_capacity_default
+    [[ "$pd_mode" != decode ]] || mega_capacity=${SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK:-256}
     [[ "$mega_capacity" =~ ^[0-9]+$ ]] && (( mega_capacity > 0 )) || die "Mega token capacity must be positive"
     env_vars+=(
         "SGLANG_HCU_MEGA_MOE_RUNTIME=$hcu_mega_moe_runtime"
@@ -578,9 +647,6 @@ if [[ "$moe_mode" == megamoe || "$dspark_moe_mode" == megamoe ]]; then
             "SGLANG_DSV4_CHANNEL_FP8_SCALE=1"
             "MEGAMOE_HCU_BACKEND=${MEGAMOE_HCU_BACKEND:-normal}"
         )
-    else
-        # Native channel-scale tensors come from the serialized checkpoint.
-        env_vars+=("DG_MEGA_HT_EXPECTED=${DG_MEGA_HT_EXPECTED:-0}")
     fi
 fi
 

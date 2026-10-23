@@ -9,51 +9,27 @@ router_port="${5:-30000}"
 bootstrap_port="${SGLANG_DISAGGREGATION_BOOTSTRAP_PORT:-8998}"
 prom_port="${SGLANG_ROUTER_PROMETHEUS_PORT:-29000}"
 
-if [[ -z "$prefill_node" ]]; then
-    p_ip="$(hostname -I | awk '{print $1}')"
-else
-    case "$prefill_node" in
-        node7) p_ip="13.13.7.7" ;;
-        node20) p_ip="13.13.7.20" ;;
-        node21) p_ip="13.13.7.21" ;;
-        node22) p_ip="13.13.7.22" ;;
-        node26) p_ip="10.16.1.26" ;;
-        node28) p_ip="10.16.1.28" ;;
-        sglang2) p_ip="10.16.1.33" ;;
-        node104) p_ip="12.12.12.104" ;;
-        node105) p_ip="12.12.12.105" ;;
-        node107) p_ip="12.12.12.107" ;;
-        node110) p_ip="12.12.12.110" ;;
-        *.*.*.*) p_ip="$prefill_node" ;;
+# HTTP/bootstrap addresses. Use the 10.16.1.x management network: it is the
+# only one every host shares. 13.13.x does not exist on nmz104/105/107/110, so
+# a 13.13.7.x prefill URL cannot be reached from a decode there (the RDMA NIC
+# itself is chosen by run_dpsk-v41.sh, see IB_RAIL / PD_PEER).
+resolve_node_ip() {
+    case "$1" in
+        "") hostname -I | awk '{print $1}' ;;
+        node7|nmz7|node15|nmz15|node18|nmz18|node20|nmz20|node21|nmz21|node22|nmz22|\
+        node26|nmz26|node28|nmz28|node104|nmz104|node105|nmz105|node107|nmz107|node110|nmz110)
+            echo "10.16.1.${1//[!0-9]/}" ;;
+        sglang2) echo 10.16.1.33 ;;
+        *.*.*.*) echo "$1" ;;
         *)
-            echo "Invalid host identifier: $prefill_node"
-            exit 1
+            echo "Invalid host identifier: $1" >&2
+            return 1
             ;;
     esac
-fi
+}
 
-if [[ -z "$decode_node" ]]; then
-    d_ip="$(hostname -I | awk '{print $1}')"
-else
-    case "$decode_node" in
-        node7) d_ip="13.13.7.7" ;;
-        node20) d_ip="13.13.7.20" ;;
-        node21) d_ip="13.13.7.21" ;;
-        node22) d_ip="13.13.7.22" ;;
-        node26) d_ip="10.16.1.26" ;;
-        node28) d_ip="10.16.1.28" ;;
-        sglang2) d_ip="10.16.1.33" ;;
-        node104) d_ip="12.12.12.104" ;;
-        node105) d_ip="12.12.12.105" ;;
-        node107) d_ip="12.12.12.107" ;;
-        node110) d_ip="12.12.12.110" ;;
-        *.*.*.*) d_ip="$decode_node" ;;
-        *)
-            echo "Invalid host identifier: $decode_node"
-            exit 1
-            ;;
-    esac
-fi
+p_ip=$(resolve_node_ip "$prefill_node") || exit 1
+d_ip=$(resolve_node_ip "$decode_node") || exit 1
 
 # 本机 ip_local_port_range = 1024-65535 且没有 ip_local_reserved_ports，
 # 内核会把 29000 / 30000 这类端口随机分配给其它进程的出站连接做源端口，
