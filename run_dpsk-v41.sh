@@ -72,6 +72,8 @@ set -o pipefail
 ##env SGLANG_HCU_PREFILL_SPARSE_FUSION=1, work only in prefill or ifb, to control the mqa logits fusion, default as 1
 ##arg --enable-single-batch-overlap, both prefill and decode support SBO but has to be disabled in megamoe mode.
 #
+# ---- 20261027 Optimizations ----
+#env HSA_USERPTR_FOR_PAGED_MEM=0
 #
 ##arg --cuda-graph-backend-decode disabled
 ##arg --enable-cp-decode-attn-tp
@@ -179,6 +181,9 @@ Core selectors:
                             deepep or megamoe.
   PC_ENABLE=0|1             Radix cache (default: 0). PD_OPEN=1 decode with
                             PC_ENABLE=1 enables the DSV4 decode radix path.
+  DSPARK=0|1                Enable DSpark speculation (default: 1). The
+                            standalone P profile (PD_OPEN=0) needs DSPARK=0:
+                            DSpark + CP only runs on the PD prefill worker.
   DSPARK_BLOCK_SIZE=N       DSpark block size (default: 5).
   DSPARK_DRAFT_MODEL_PATH=P Draft checkpoint (default: MODEL_PATH).
   MEM_FRACTION_STATIC=F     KV cache memory fraction (default: 0.85; Mega P: 0.80).
@@ -337,6 +342,9 @@ append_distributed_init_args() {
 }
 
 append_draft_moe_args() {
+    # No draft model is loaded when DSPARK is off, so these speculative MoE
+    # backend args would be dead configuration.
+    [[ "$dspark_enable" == 1 ]] || return 0
     local mode=$dspark_moe_mode
     # [[ "$1" != decode ]] || mode=$dspark_moe_mode
     case "$mode" in
@@ -362,9 +370,15 @@ append_prefill_args() {
         --cp-strategy interleave
         --dp 1
         --attn-cp-size "$tp_size"
-        --enable-cp-cache-layer-split
         --enable-decoder-swa-bounded-replay
     )
+    # Cache LayerSplit persists only the layers owned by each CP rank, and the
+    # decode side pulls the rest through PD transfer, so a non-PD worker (which
+    # also decodes) cannot read them locally. Keep it on the PD prefill half
+    # only: PD_OPEN=0 runs the same topology standalone on a single node.
+    if [[ "$pd_open" == 1 ]]; then
+        DEFAULT_ARGS+=(--enable-cp-cache-layer-split)
+    fi
     case "$moe_mode" in
         none|triton)
             DEFAULT_ARGS+=(
@@ -475,7 +489,7 @@ print_launch_profile() {
     echo "---- Launch Profile ------"
     echo "host=$the_host ip=$ip port=$port model=$model_path"
     echo "rdma=$IB_DEVICES (IB_RAIL=$IB_RAIL) socket_ifname=$net_ifname"
-    echo "HCU_NUM=$tp_size PD_MODE=$pd_mode PD_OPEN=$pd_open MOE_MODE=$moe_mode PC_ENABLE=$pc_enable"
+    echo "HCU_NUM=$tp_size PD_MODE=$pd_mode PD_OPEN=$pd_open DSPARK=$dspark_enable MOE_MODE=$moe_mode PC_ENABLE=$pc_enable"
     echo "SGLANG_HCU_MEGA_MOE_RUNTIME=$hcu_mega_moe_runtime DSPARK_MOE_MODE=$dspark_moe_mode CHUNK_SIZE=$chunk_size"
     echo "DSPARK_BLOCK_SIZE=$dspark_block_size MEM_FRACTION_STATIC=$mem_fraction_static MAX_RUNNING_REQUESTS=$max_running_requests"
     echo "NNODES=$nnodes NODE_RANK=$node_rank DIST_INIT_ADDR=${dist_init_addr:-auto}"
@@ -526,6 +540,7 @@ dspark_moe_mode=${DSPARK_MOE_MODE:-$moe_mode}
 #     dspark_moe_mode=${DSPARK_MOE_MODE:-$moe_mode}
 # fi
 pc_enable=${PC_ENABLE:-0}
+dspark_enable=${DSPARK:-1}
 dspark_block_size=${DSPARK_BLOCK_SIZE:-5}
 dspark_draft_model_path=${DSPARK_DRAFT_MODEL_PATH:-$model_path}
 mem_fraction_default=0.85
@@ -548,11 +563,17 @@ local_decode_dist_port=${DECODE_DIST_INIT_PORT:-$((port + 733))}
 case "$pd_mode" in none|prefill|decode) ;; *) die "Invalid PD_MODE=$pd_mode (expected: none|prefill|decode)" ;; esac
 case "$moe_mode" in none|triton|aiter|deepep|megamoe|humming) ;; *) die "Invalid MOE_MODE=$moe_mode (expected: none|triton|aiter|deepep|megamoe|humming)" ;; esac
 case "$dspark_moe_mode" in none|triton|aiter|humming) dspark_moe_mode=none ;; deepep|megamoe) ;; *) die "Invalid DSPARK_MOE_MODE=$dspark_moe_mode (expected: none|deepep|megamoe)" ;; esac
+case "$dspark_enable" in 0|1) ;; *) die "DSPARK must be 0 or 1 (got: $dspark_enable)" ;; esac
 [[ "$chunk_size" =~ ^[0-9]+$ ]] && (( chunk_size > 0 )) || die "CHUNK_SIZE must be positive"
 case "$pc_enable" in 0|1) ;; *) die "PC_ENABLE must be 0 or 1" ;; esac
 case "$pd_open" in 0|1) ;; *) die "PD_OPEN must be 0 or 1" ;; esac
 if [[ "$pd_open" == 1 && "$pd_mode" == none ]]; then
     die "PD_OPEN=1 requires PD_MODE=prefill or PD_MODE=decode"
+fi
+# DSpark's CP path is only implemented for the PD prefill worker; a standalone
+# prefill service also decodes, so the runtime rejects DSPARK + attn_cp_size>1.
+if [[ "$pd_mode" == prefill && "$pd_open" == 0 && "$dspark_enable" == 1 ]] && (( tp_size > 1 )); then
+    die "DSPARK + CP only runs on the PD prefill worker: use PD_OPEN=1 for real PD, or DSPARK=0 for the single-node P profile (prefill-only perf testing)."
 fi
 [[ "$moe_mode" != deepep ]] || require_file "$DEEPEP_CONFIG" "DEEPEP_CONFIG does not exist"
 
@@ -678,13 +699,20 @@ DEFAULT_ARGS=(
     --mem-fraction-static "$mem_fraction_static"
     --max-running-requests "$max_running_requests"
     --cuda-graph-max-bs-decode 32
-    --speculative-algorithm DSPARK
-    --speculative-dspark-block-size "$dspark_block_size"
     --reasoning-parser auto
     --tool-call-parser auto
     --chunked-prefill-size "$chunk_size"
 )
 append_distributed_init_args
+
+# DSpark drives speculative decoding; without it the service is a plain
+# target-model server (used by the single-node P profile for prefill tests).
+if [[ "$dspark_enable" == 1 ]]; then
+    DEFAULT_ARGS+=(
+        --speculative-algorithm DSPARK
+        --speculative-dspark-block-size "$dspark_block_size"
+    )
+fi
 
 # The original standalone profile runs the MoE through the triton runner;
 # the P/D paths select explicit target and draft MoE backends per MOE_MODE.

@@ -8,6 +8,10 @@ decode_port="${4:-10016}"
 router_port="${5:-30000}"
 bootstrap_port="${SGLANG_DISAGGREGATION_BOOTSTRAP_PORT:-8998}"
 prom_port="${SGLANG_ROUTER_PROMETHEUS_PORT:-29000}"
+# The router cuts any request still streaming after this long (its default is
+# 1800 s). Thinking-mode evals (gpqa max_tokens 131072, client timeout 7200 s)
+# run longer than 30 minutes per answer, so match the eval timeout.
+request_timeout="${ROUTER_REQUEST_TIMEOUT_SECS:-7200}"
 
 # HTTP/bootstrap addresses. Use the 10.16.1.x management network: it is the
 # only one every host shares. 13.13.x does not exist on nmz104/105/107/110, so
@@ -38,6 +42,9 @@ port_free() {
     python3 -c "
 import socket, sys
 s = socket.socket()
+# Bind like the router does: TIME_WAIT from a just-stopped router is fine,
+# a live listener or an outbound socket holding the port is not.
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     s.bind(('0.0.0.0', int(sys.argv[1])))
 except OSError:
@@ -68,7 +75,7 @@ if ! port_free "$prom_port"; then
     fi
 fi
 
-echo "Starting PD router: prefill=${p_ip}:${prefill_port} (bootstrap ${bootstrap_port}), decode=${d_ip}:${decode_port}, router=:${router_port}, prometheus=:${prom_port}"
+echo "Starting PD router: prefill=${p_ip}:${prefill_port} (bootstrap ${bootstrap_port}), decode=${d_ip}:${decode_port}, router=:${router_port}, prometheus=:${prom_port}, request timeout=${request_timeout}s"
 
 # Publish the exact endpoints used by this router. The profiling benchmark reads
 # this shared state instead of maintaining a second, easily stale host mapping.
@@ -87,4 +94,5 @@ python -m sglang_router.launch_router \
     --decode "http://${d_ip}:${decode_port}" \
     --host 0.0.0.0 \
     --port "${router_port}" \
-    --prometheus-port "${prom_port}"
+    --prometheus-port "${prom_port}" \
+    --request-timeout-secs "${request_timeout}"
