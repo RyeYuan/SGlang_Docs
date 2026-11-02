@@ -75,6 +75,13 @@ set -o pipefail
 # ---- 20261027 Optimizations ----
 #env HSA_USERPTR_FOR_PAGED_MEM=0
 #
+# ---- 20261030 Optimizations ----
+#env SGLANG_HCU_FUSED_MHC_BOUNDARY=1
+##EPLB_LOCATION=/home/proj_dpsk-v4/expert_dist/eplb_fp8_runB64_r32.pt
+##EPLB_REDUNDANT=32
+##SGLANG_LPLB_HIP_SOLVER=device
+##EPLB_DISPATCH=lp
+#
 ##arg --cuda-graph-backend-decode disabled
 ##arg --enable-cp-decode-attn-tp
 ##env SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED=1, need to lightop support special page_size
@@ -164,6 +171,8 @@ Core selectors:
                             0  Same topology, standalone: the P or D profile
                                runs on its own with no transfer arguments.
                             Requires PD_MODE=prefill or PD_MODE=decode.
+  FAKE_P=0|1                Decode-only fake prefill mode (default: 0). When 1,
+                            uses PD parameters with fake transfer.
   SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe|deep_gemm
                             HCU Mega implementation (default: megamoe).
                             deep_gemm requires deepgemm.mega with V4.1 DSpark TopK3.
@@ -201,6 +210,25 @@ Core selectors:
   PD_PREFILL_DIST_PORT=N    PD P-side init port (default: 6144).
   PD_DECODE_DIST_PORT=N     PD D-side init port (default: 6244).
   DECODE_DIST_INIT_PORT=N   Standalone decode init port (default: PORT + 733).
+  EXPERT_DIST_MODE=stat|per_pass|per_token
+                            Enable the expert distribution recorder (default:
+                            off). Recording is driven over HTTP:
+                            /start_expert_distribution_record, then
+                            /stop_... and /dump_expert_distribution_record.
+  EXPERT_DIST_DIR=DIR       Recorder dump directory
+                            (default: /home/proj_dpsk-v4/expert_dist).
+  EXPERT_DIST_BUFFER=N      Recorder buffer size in forward passes (default: 1000).
+  EPLB_LOCATION=FILE        Static expert placement for --init-expert-location
+                            (.pt/.json with physical_to_logical_map or
+                            logical_count; default: trivial).
+  EPLB_REDUNDANT=N          --ep-num-redundant-experts with EPLB_LOCATION
+                            (default: 0).
+  WATERFILL=0|1             --enable-waterfill (shared expert fused as an extra
+                            routed slot, balanced per batch; default: 0).
+  EPLB_DISPATCH=static|dynamic|lp
+                            --ep-dispatch-algorithm with EPLB_LOCATION (default:
+                            server picks static). lp = per-batch LPLB replica
+                            split (HCU: host water-filling, prefill only).
   DRY_RUN=1                 Print the resolved command without starting.
 
 Adding an optimization point:
@@ -489,10 +517,13 @@ print_launch_profile() {
     echo "---- Launch Profile ------"
     echo "host=$the_host ip=$ip port=$port model=$model_path"
     echo "rdma=$IB_DEVICES (IB_RAIL=$IB_RAIL) socket_ifname=$net_ifname"
-    echo "HCU_NUM=$tp_size PD_MODE=$pd_mode PD_OPEN=$pd_open DSPARK=$dspark_enable MOE_MODE=$moe_mode PC_ENABLE=$pc_enable"
+    echo "HCU_NUM=$tp_size PD_MODE=$pd_mode PD_OPEN=$pd_open FAKE_P=$fake_p DSPARK=$dspark_enable MOE_MODE=$moe_mode PC_ENABLE=$pc_enable"
     echo "SGLANG_HCU_MEGA_MOE_RUNTIME=$hcu_mega_moe_runtime DSPARK_MOE_MODE=$dspark_moe_mode CHUNK_SIZE=$chunk_size"
     echo "DSPARK_BLOCK_SIZE=$dspark_block_size MEM_FRACTION_STATIC=$mem_fraction_static MAX_RUNNING_REQUESTS=$max_running_requests"
     echo "NNODES=$nnodes NODE_RANK=$node_rank DIST_INIT_ADDR=${dist_init_addr:-auto}"
+    [[ -z "$expert_dist_mode" ]] || echo "EXPERT_DIST_MODE=$expert_dist_mode EXPERT_DIST_DIR=$expert_dist_dir EXPERT_DIST_BUFFER=$expert_dist_buffer"
+    [[ "$waterfill" != 1 ]] || echo "WATERFILL=1"
+    [[ -z "$eplb_location" ]] || echo "EPLB_LOCATION=$eplb_location EPLB_REDUNDANT=$eplb_redundant EPLB_DISPATCH=${eplb_dispatch:-auto}"
 }
 
 if [[ "${1:-}" == -h || "${1:-}" == --help || "${HELP:-0}" == 1 ]]; then
@@ -524,6 +555,7 @@ nnodes=${NNODES:-2}
 node_rank=${NODE_RANK:-$rank_id}
 pd_mode=${PD_MODE:-none}
 pd_open=${PD_OPEN:-0}
+fake_p=${FAKE_P:-0}
 moe_mode=${MOE_MODE:-none}
 hcu_mega_moe_runtime=${SGLANG_HCU_MEGA_MOE_RUNTIME:-megamoe}
 chunk_size_default=32768
@@ -556,6 +588,13 @@ pd_prefill_dist_port=${PD_PREFILL_DIST_PORT:-6144}
 pd_decode_dist_port=${PD_DECODE_DIST_PORT:-6244}
 multi_node_dist_port=${DIST_INIT_PORT:-6245}
 local_decode_dist_port=${DECODE_DIST_INIT_PORT:-$((port + 733))}
+expert_dist_mode=${EXPERT_DIST_MODE:-}
+expert_dist_dir=${EXPERT_DIST_DIR:-/home/proj_dpsk-v4/expert_dist}
+expert_dist_buffer=${EXPERT_DIST_BUFFER:-1000}
+eplb_location=${EPLB_LOCATION:-}
+eplb_redundant=${EPLB_REDUNDANT:-0}
+eplb_dispatch=${EPLB_DISPATCH:-}
+waterfill=${WATERFILL:-0}
 
 [[ "$tp_size" =~ ^[0-9]+$ ]] && (( tp_size > 0 )) || die "HCU_NUM must be a positive integer (got: $tp_size)"
 [[ "$dspark_block_size" =~ ^[0-9]+$ ]] && (( dspark_block_size > 0 )) || die "DSPARK_BLOCK_SIZE must be a positive integer (got: $dspark_block_size)"
@@ -566,7 +605,20 @@ case "$dspark_moe_mode" in none|triton|aiter|humming) dspark_moe_mode=none ;; de
 case "$dspark_enable" in 0|1) ;; *) die "DSPARK must be 0 or 1 (got: $dspark_enable)" ;; esac
 [[ "$chunk_size" =~ ^[0-9]+$ ]] && (( chunk_size > 0 )) || die "CHUNK_SIZE must be positive"
 case "$pc_enable" in 0|1) ;; *) die "PC_ENABLE must be 0 or 1" ;; esac
+case "$fake_p" in 0|1) ;; *) die "FAKE_P must be 0 or 1" ;; esac
 case "$pd_open" in 0|1) ;; *) die "PD_OPEN must be 0 or 1" ;; esac
+if [[ "$fake_p" == 1 ]]; then
+    [[ "$pd_mode" == decode ]] || die "FAKE_P=1 requires PD_MODE=decode"
+    pd_open=1
+fi
+case "$expert_dist_mode" in ""|stat|per_pass|per_token) ;; *) die "Invalid EXPERT_DIST_MODE=$expert_dist_mode (expected: stat|per_pass|per_token)" ;; esac
+[[ "$expert_dist_buffer" =~ ^[0-9]+$ ]] && (( expert_dist_buffer > 0 )) || die "EXPERT_DIST_BUFFER must be a positive integer (got: $expert_dist_buffer)"
+[[ "$eplb_redundant" =~ ^[0-9]+$ ]] || die "EPLB_REDUNDANT must be a non-negative integer (got: $eplb_redundant)"
+[[ -z "$eplb_location" ]] || require_file "$eplb_location" "EPLB_LOCATION does not exist"
+[[ -n "$eplb_location" || "$eplb_redundant" == 0 ]] || die "EPLB_REDUNDANT requires EPLB_LOCATION"
+case "$waterfill" in 0|1) ;; *) die "WATERFILL must be 0 or 1" ;; esac
+case "$eplb_dispatch" in ""|static|dynamic|lp) ;; *) die "Invalid EPLB_DISPATCH=$eplb_dispatch (expected: static|dynamic|lp)" ;; esac
+[[ -n "$eplb_location" || -z "$eplb_dispatch" ]] || die "EPLB_DISPATCH requires EPLB_LOCATION"
 if [[ "$pd_open" == 1 && "$pd_mode" == none ]]; then
     die "PD_OPEN=1 requires PD_MODE=prefill or PD_MODE=decode"
 fi
@@ -619,6 +671,13 @@ if [[ "$pd_open" == 1 ]]; then
         "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1"
     )
 fi
+if [[ "$fake_p" == 1 ]]; then
+    env_vars+=(
+        "SGLANG_SIMULATE_ACC_LEN=3.5"
+        "SGLANG_SIMULATE_ACC_METHOD=match-expected"
+        "SGLANG_RAGGED_VERIFY_MODE=static"
+    )
+fi
 if [[ "$pc_enable" == 1 && "$pd_open" == 1 && "$pd_mode" == decode ]]; then
     # DSV4 uses compressed KV plus SWA. Decode-side prefix reuse therefore
     # requires the unified radix tree and the guarded DSV4 implementation.
@@ -669,6 +728,12 @@ if [[ "$moe_mode" == megamoe || "$dspark_moe_mode" == megamoe ]]; then
             "MEGAMOE_HCU_BACKEND=${MEGAMOE_HCU_BACKEND:-normal}"
         )
     fi
+fi
+
+# Expert load analysis (EPLB input). The recorder writes one file per rank.
+if [[ -n "$expert_dist_mode" ]]; then
+    mkdir -p "$expert_dist_dir" || die "Cannot create EXPERT_DIST_DIR=$expert_dist_dir"
+    env_vars+=("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=$expert_dist_dir")
 fi
 
 if [[ "$pd_mode" == decode ]]; then
@@ -730,6 +795,22 @@ esac
 if [[ "$pc_enable" == 1 && "$pd_open" == 1 && "$pd_mode" == decode ]]; then
     DEFAULT_ARGS+=(--disaggregation-decode-enable-radix-cache)
 fi
+if [[ -n "$expert_dist_mode" ]]; then
+    DEFAULT_ARGS+=(
+        --expert-distribution-recorder-mode "$expert_dist_mode"
+        --expert-distribution-recorder-buffer-size "$expert_dist_buffer"
+    )
+fi
+if [[ -n "$eplb_location" ]]; then
+    DEFAULT_ARGS+=(
+        --init-expert-location "$eplb_location"
+        --ep-num-redundant-experts "$eplb_redundant"
+    )
+    [[ -z "$eplb_dispatch" ]] || DEFAULT_ARGS+=(--ep-dispatch-algorithm "$eplb_dispatch")
+fi
+# Waterfill: fuse the shared expert as an extra routed slot and assign it to the
+# least-loaded EP rank per batch (implies --enforce-shared-experts-fusion).
+[[ "$waterfill" != 1 ]] || DEFAULT_ARGS+=(--enable-waterfill)
 
 # 动态优化点登记处里的指令（见文件顶部 OPT-BEGIN 区块）
 if (( ${#OPT_ARGS[@]} > 0 )); then
