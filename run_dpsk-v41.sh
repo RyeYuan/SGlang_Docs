@@ -82,6 +82,12 @@ set -o pipefail
 ##SGLANG_LPLB_HIP_SOLVER=device
 ##EPLB_DISPATCH=lp
 #
+# ---- 20261103 Optimizations ----
+##env SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE=8, only work in decode, default as 1
+##arg --speculative-draft-lm-head-vp-size 8, only work in decode, default as 1
+#
+#
+#
 ##arg --cuda-graph-backend-decode disabled
 ##arg --enable-cp-decode-attn-tp
 ##env SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED=1, need to lightop support special page_size
@@ -452,6 +458,7 @@ append_decode_args() {
         --enable-dp-attention-local-control-broadcast
         --enable-dp-lm-head
         --ep "$tp_size"
+        --speculative-draft-lm-head-vp-size "$dp_size"
     )
     case "$moe_mode" in
         none|triton)
@@ -740,6 +747,7 @@ if [[ "$pd_mode" == decode ]]; then
     env_vars+=(
         "DEEPEP_ENABLE_LL_LAYERED_OPT=1"
         "ROCSHMEM_DISABLE_HDP_FLUSH=1"
+        "SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE=$dp_size"
     )
 fi
 
