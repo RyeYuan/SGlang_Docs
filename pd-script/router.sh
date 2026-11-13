@@ -20,6 +20,7 @@ request_timeout="${ROUTER_REQUEST_TIMEOUT_SECS:-7200}"
 resolve_node_ip() {
     case "$1" in
         "") hostname -I | awk '{print $1}' ;;
+        node2|nmz2|node9|nmz9|\
         node7|nmz7|node15|nmz15|node18|nmz18|node20|nmz20|node21|nmz21|node22|nmz22|\
         node26|nmz26|node28|nmz28|node104|nmz104|node105|nmz105|node107|nmz107|node110|nmz110)
             echo "10.16.1.${1//[!0-9]/}" ;;

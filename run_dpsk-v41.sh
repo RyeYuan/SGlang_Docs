@@ -86,7 +86,8 @@ set -o pipefail
 ##env SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE=8, only work in decode, default as 1
 ##arg --speculative-draft-lm-head-vp-size 8, only work in decode, default as 1
 #
-#
+# ---- 20261112 Optimizations ----
+##env SGLANG_HCU_DSV41_BF16_MAIN_PROJ_PREPACK=1, only work in prefill, default as 0
 #
 ##arg --cuda-graph-backend-decode disabled
 ##arg --enable-cp-decode-attn-tp
@@ -458,7 +459,7 @@ append_decode_args() {
         --enable-dp-attention-local-control-broadcast
         --enable-dp-lm-head
         --ep "$tp_size"
-        --speculative-draft-lm-head-vp-size "$dp_size"
+        # --speculative-draft-lm-head-vp-size "$dp_size"
     )
     case "$moe_mode" in
         none|triton)
@@ -743,11 +744,17 @@ if [[ -n "$expert_dist_mode" ]]; then
     env_vars+=("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=$expert_dist_dir")
 fi
 
+if [[ "$pd_mode" == prefill ]]; then
+    env_vars+=(
+        "SGLANG_HCU_DSV41_BF16_MAIN_PROJ_PREPACK=1"
+    )
+fi
+
 if [[ "$pd_mode" == decode ]]; then
     env_vars+=(
         "DEEPEP_ENABLE_LL_LAYERED_OPT=1"
         "ROCSHMEM_DISABLE_HDP_FLUSH=1"
-        "SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE=$dp_size"
+        # "SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE=$dp_size"
     )
 fi
 
