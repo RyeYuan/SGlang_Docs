@@ -25,6 +25,10 @@ resolve_node_ip() {
         node26|nmz26|node28|nmz28|node104|nmz104|node105|nmz105|node107|nmz107|node110|nmz110)
             echo "10.16.1.${1//[!0-9]/}" ;;
         sglang2) echo 10.16.1.33 ;;
+        s1)      echo 10.41.103.12 ;;
+        s5)      echo 10.41.103.19 ;;
+        s6)      echo 10.41.103.11 ;;
+        s7)      echo 10.41.103.8 ;;
         *.*.*.*) echo "$1" ;;
         *)
             echo "Invalid host identifier: $1" >&2

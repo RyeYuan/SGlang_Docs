@@ -236,6 +236,17 @@ Core selectors:
                             --ep-dispatch-algorithm with EPLB_LOCATION (default:
                             server picks static). lp = per-batch LPLB replica
                             split (HCU: host water-filling, prefill only).
+  WEIGHT_CACHE=off|daemon|client
+                            Weight cache (default: off). Load once, restart fast:
+                            daemon  Start the weight cache daemons instead of the
+                                    service, with this exact environment and
+                                    argument list. Keep it running.
+                            client  Start the service with
+                                    --weight-cache-mode client: it maps the
+                                    daemon's weights instead of reading the disk.
+                            Both runs must use identical settings (same env,
+                            MODEL_PATH, topology, EPLB_LOCATION); restart the
+                            daemon after changing any of them. Needs DSPARK=0.
   DRY_RUN=1                 Print the resolved command without starting.
 
 Adding an optimization point:
@@ -320,7 +331,7 @@ resolve_network_interface() {
         nmz26|nmz20|nmz22|nmz21|nmz18|nmz15|nmz28) echo ens66f1np1 ;;
         nmz7) echo ens61f1np1 ;;  # rail 2 (13.13.2.7); its ens66f1np1 is rail 4
         nmz105|nmz107|nmz104|nmz110) echo ens65f0np0 ;;
-        S1|S4|S5|S7|S9) echo ens30np0 ;;
+        S1|S4|S5|S6|S7|S9) echo ens30np0 ;;
         sglang5) echo eth0 ;;
         sglang8) echo enp113s0f0np0 ;;
         sglang6) echo eth10 ;;
@@ -502,7 +513,7 @@ append_decode_args() {
 
 print_command() {
     local index=0 arg next
-    printf '%s\n' "sglang serve \\"
+    printf '%s\n' "$launch_label \\"
     while [[ $index -lt ${#FINAL_ARGS[@]} ]]; do
         arg="${FINAL_ARGS[$index]}"
         if [[ "$arg" == --* ]]; then
@@ -837,6 +848,34 @@ if (( ${#OPT_ARGS[@]} > 0 )); then
     done
 fi
 
+# Weight cache: the daemon takes the very argument list the service gets, so
+# both are derived here from one DEFAULT_ARGS.
+weight_cache=${WEIGHT_CACHE:-off}
+launch_cmd=(sglang serve)
+launch_label="sglang serve"
+log_suffix=""
+case "$weight_cache" in
+    off) ;;
+    daemon|client)
+        [[ "$dspark_enable" != 1 ]] || die "WEIGHT_CACHE=$weight_cache needs DSPARK=0: the weight cache does not export the draft model"
+        # The adapted tree must be the one python resolves (see PYTHONPATH above).
+        python3 - <<'PYCHECK' || die "WEIGHT_CACHE=$weight_cache: the sglang tree on PYTHONPATH has no weight_cache/extra_state.py (channel-FP8 adaptation); point PYTHONPATH at the adapted tree"
+import importlib.util, os, sys
+spec = importlib.util.find_spec("sglang")
+root = os.path.dirname(spec.origin) if spec and spec.origin else ""
+sys.exit(0 if os.path.isfile(os.path.join(root, "srt", "weight_cache", "extra_state.py")) else 1)
+PYCHECK
+        if [[ "$weight_cache" == daemon ]]; then
+            launch_cmd=(python3 -m sglang.srt.weight_cache.daemon)
+            launch_label="python3 -m sglang.srt.weight_cache.daemon"
+            log_suffix="_wcdaemon"
+        else
+            DEFAULT_ARGS+=(--weight-cache-mode client)
+        fi
+        ;;
+    *) die "Invalid WEIGHT_CACHE=$weight_cache (expected: off|daemon|client)" ;;
+esac
+
 FINAL_ARGS=("${DEFAULT_ARGS[@]}")
 print_launch_profile
 echo "---- Current Running Cmd ------"
@@ -847,6 +886,7 @@ postfix="${the_host}_${pd_mode}"
 # the same host, so keep their logs apart. PD_OPEN=1 keeps the historical
 # names, which existing launcher scripts and collected logs already use.
 [[ "$pd_mode" == none || "$pd_open" == 1 ]] || postfix="${postfix}_nodisagg"
+postfix="${postfix}${log_suffix}"
 printf '%s\n' " 2>&1 | tee running_dpsk-v41_${postfix}.log"
 printf '%s\n' "--------------------------------"
 
@@ -855,4 +895,4 @@ if [[ "${DRY_RUN:-0}" == 1 ]]; then
     exit 0
 fi
 
-sglang serve "${FINAL_ARGS[@]}" 2>&1 | tee "running_dpsk-v41_${postfix}.log"
+"${launch_cmd[@]}" "${FINAL_ARGS[@]}" 2>&1 | tee "running_dpsk-v41_${postfix}.log"
